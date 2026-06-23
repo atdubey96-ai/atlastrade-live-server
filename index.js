@@ -206,6 +206,12 @@ async function ensureLoggedIn() {
 ensureLoggedIn();
 setInterval(ensureLoggedIn, 30 * 60 * 1000); // check every 30 min
 
+// Self-ping every 14 minutes to prevent Render free tier spin-down
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+setInterval(() => {
+  fetch(`${SELF_URL}/health`).catch(() => {});
+}, 14 * 60 * 1000);
+
 // ─── REST API ────────────────────────────────────────────────────────────────
 
 // Health check
