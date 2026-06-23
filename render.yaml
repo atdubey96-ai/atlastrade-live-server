@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: atlastrade-live-server
+    runtime: node
+    rootDir: server
+    buildCommand: npm install
+    startCommand: npm start
+    plan: free
+    envVars:
+      - key: AO_API_KEY
+        sync: false
+      - key: AO_CLIENT_ID
+        sync: false
+      - key: AO_PASSWORD
+        sync: false
+      - key: AO_TOTP_KEY
+        sync: false
