@@ -1,0 +1,28 @@
+app:
+  name: atlastrade-live-server
+services:
+  - name: atlastrade-live-server
+    type: web
+    git:
+      repository: github.com/atdubey96-ai/atlastrade-live-server
+      branch: main
+    build:
+      buildpack: nodejs
+    run:
+      command: npm start
+    ports:
+      - port: 3001
+        protocol: http
+    env:
+      - key: AO_API_KEY
+        secret: true
+      - key: AO_CLIENT_ID
+        secret: true
+      - key: AO_PASSWORD
+        secret: true
+      - key: AO_TOTP_KEY
+        secret: true
+    instance_type: nano
+    scaling:
+      min: 1
+      max: 1
