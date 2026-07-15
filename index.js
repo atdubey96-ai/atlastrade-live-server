@@ -138,22 +138,27 @@ function parseBinaryTick(buf) {
     if (subscriptionMode !== 1 && subscriptionMode !== 2 && subscriptionMode !== 3) return;
     const exchType = buf.readUInt8(1);
     const token = buf.slice(2, 27).toString("utf8").replace(/\0/g, "").trim();
-    const seqNum = buf.readBigUInt64BE(27);
-    const exchTs = buf.readBigUInt64BE(35);
-    const ltp = buf.readInt32BE(43) / 100;
-    const ltq = buf.readInt32BE(47);
-    const avgPrice = buf.readInt32BE(51) / 100;
-    const volume = buf.readInt32BE(55);
-    const totalBuy = buf.readInt32BE(59);
-    const totalSell = buf.readInt32BE(63);
-    const open = buf.readInt32BE(67) / 100;
-    const high = buf.readInt32BE(71) / 100;
-    const low = buf.readInt32BE(75) / 100;
-    const close = buf.readInt32BE(79) / 100;
+    const seqNum = buf.readBigUInt64LE(27);
+    const exchTs = buf.readBigUInt64LE(35);
+    const ltp = buf.readInt32LE(43) / 100;
+    const ltq = buf.readInt32LE(47);
+    const avgPrice = buf.readInt32LE(51) / 100;
+    const volume = buf.readInt32LE(55);
+    const totalBuy = buf.readInt32LE(59);
+    const totalSell = buf.readInt32LE(63);
+    const open = buf.readInt32LE(67) / 100;
+    const high = buf.readInt32LE(71) / 100;
+    const low = buf.readInt32LE(75) / 100;
+    const close = buf.readInt32LE(79) / 100;
 
     const sym = tokenToSymbol.get(token);
-    if (sym && ltp > 0) {
-      prices[sym] = { ltp, open, high, low, close, volume, avgPrice, ts: Date.now() };
+    const exchangeTime = Number(exchTs);
+    const sane = [ltp, open, high, low, close].every(value => Number.isFinite(value) && value >= 0)
+      && ltp > 0 && ltp < 1_000_000
+      && (!close || (ltp / close > 0.1 && ltp / close < 10));
+    if (sym && sane) {
+      const normalizedExchangeTime = exchangeTime > 1e12 ? exchangeTime : (exchangeTime > 1e9 ? exchangeTime * 1000 : Date.now());
+      prices[sym] = { ltp, open, high, low, close, volume, avgPrice, ts: normalizedExchangeTime };
     }
   } catch (_) {}
 }
