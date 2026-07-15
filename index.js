@@ -22,6 +22,7 @@ const prices = {};       // { "RELIANCE": { ltp, open, high, low, close, volume,
 let aoToken = null;
 let aoFeedToken = null;
 let wsConn = null;
+let wsHeartbeatTimer = null;
 let subscribedTokens = new Set();
 let lastLoginAt = 0;
 let loginInProgress = false;
@@ -103,6 +104,10 @@ function connectWebSocket() {
 
   wsConn.on("open", () => {
     console.log("Angel One WebSocket connected");
+    clearInterval(wsHeartbeatTimer);
+    wsHeartbeatTimer = setInterval(() => {
+      if (wsConn?.readyState === WebSocket.OPEN) wsConn.send("ping");
+    }, 25000);
     // Re-subscribe all tracked tokens
     if (subscribedTokens.size > 0) {
       resubscribeAll();
@@ -122,6 +127,8 @@ function connectWebSocket() {
   });
 
   wsConn.on("close", (code) => {
+    clearInterval(wsHeartbeatTimer);
+    wsHeartbeatTimer = null;
     console.log(`WebSocket closed (${code}), reconnecting in 5s`);
     setTimeout(connectWebSocket, 5000);
   });
@@ -138,18 +145,20 @@ function parseBinaryTick(buf) {
     if (subscriptionMode !== 1 && subscriptionMode !== 2 && subscriptionMode !== 3) return;
     const exchType = buf.readUInt8(1);
     const token = buf.slice(2, 27).toString("utf8").replace(/\0/g, "").trim();
-    const seqNum = buf.readBigUInt64LE(27);
-    const exchTs = buf.readBigUInt64LE(35);
-    const ltp = buf.readInt32LE(43) / 100;
-    const ltq = buf.readInt32LE(47);
-    const avgPrice = buf.readInt32LE(51) / 100;
-    const volume = buf.readInt32LE(55);
-    const totalBuy = buf.readInt32LE(59);
-    const totalSell = buf.readInt32LE(63);
-    const open = buf.readInt32LE(67) / 100;
-    const high = buf.readInt32LE(71) / 100;
-    const low = buf.readInt32LE(75) / 100;
-    const close = buf.readInt32LE(79) / 100;
+    if (buf.length < 51) return;
+    const seqNum = buf.readBigInt64LE(27);
+    const exchTs = buf.readBigInt64LE(35);
+    const ltp = Number(buf.readBigInt64LE(43)) / 100;
+    const hasQuoteFields = buf.length >= 123;
+    const ltq = hasQuoteFields ? Number(buf.readBigInt64LE(51)) : 0;
+    const avgPrice = hasQuoteFields ? Number(buf.readBigInt64LE(59)) / 100 : 0;
+    const volume = hasQuoteFields ? Number(buf.readBigInt64LE(67)) : 0;
+    const totalBuy = hasQuoteFields ? buf.readDoubleLE(75) : 0;
+    const totalSell = hasQuoteFields ? buf.readDoubleLE(83) : 0;
+    const open = hasQuoteFields ? Number(buf.readBigInt64LE(91)) / 100 : 0;
+    const high = hasQuoteFields ? Number(buf.readBigInt64LE(99)) / 100 : 0;
+    const low = hasQuoteFields ? Number(buf.readBigInt64LE(107)) / 100 : 0;
+    const close = hasQuoteFields ? Number(buf.readBigInt64LE(115)) / 100 : 0;
 
     const sym = tokenToSymbol.get(token);
     const exchangeTime = Number(exchTs);
