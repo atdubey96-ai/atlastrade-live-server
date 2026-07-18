@@ -31,6 +31,7 @@ let lastWsOpenAt = 0;
 let wsFailureCount = 0;
 let loginInProgress = false;
 let snapshotInFlight = null;
+const pendingSnapshotPairs = new Map();
 
 // ─── TOTP generation (RFC 6238) ──────────────────────────────────────────────
 function base32Decode(str) {
@@ -234,51 +235,64 @@ function angelTimestamp(value) {
 
 async function primeSnapshots(pairs = []) {
   if (!aoToken || !pairs.length) return 0;
+  pairs.forEach(pair => pendingSnapshotPairs.set(`${String(pair.exchange || "NSE").toUpperCase()}:${pair.token}`, pair));
   if (snapshotInFlight) return snapshotInFlight;
   snapshotInFlight = (async () => {
-    const byExchange = new Map();
-    for (const pair of pairs) {
-      const exchange = String(pair.exchange || "NSE").toUpperCase();
-      if (!byExchange.has(exchange)) byExchange.set(exchange, []);
-      byExchange.get(exchange).push(String(pair.token));
-    }
-    let count = 0;
-    for (const [exchange, tokens] of byExchange) {
-      const unique = [...new Set(tokens)];
-      for (let offset = 0; offset < unique.length; offset += 50) {
-        const chunk = unique.slice(offset, offset + 50);
-        const response = await fetch("https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/", {
-          method: "POST",
-          headers: quoteHeaders(),
-          body: JSON.stringify({ mode: "FULL", exchangeTokens: { [exchange]: chunk } }),
-        });
-        if (!response.ok) throw new Error(`Angel snapshot HTTP ${response.status}`);
-        const payload = await response.json();
-        const rows = Array.isArray(payload?.data?.fetched) ? payload.data.fetched : [];
-        for (const row of rows) {
-          const token = String(row.symbolToken || row.symboltoken || "");
-          const symbol = tokenToSymbol.get(token);
-          const ltp = Number(row.ltp || 0);
-          const close = Number(row.close || row.prevClose || 0);
-          if (!symbol || !Number.isFinite(ltp) || ltp <= 0 || ltp >= 1_000_000) continue;
-          if (close > 0 && (ltp / close <= 0.1 || ltp / close >= 10)) continue;
-          const normalizedTs = angelTimestamp(row.exchFeedTime || row.exchangeTime);
-          prices[symbol] = {
-            ltp,
-            open: Number(row.open || ltp),
-            high: Number(row.high || ltp),
-            low: Number(row.low || ltp),
-            close: close || ltp,
-            volume: Number(row.tradeVolume || row.volume || 0),
-            avgPrice: Number(row.avgPrice || row.averagePrice || 0),
-            ts: normalizedTs,
-          };
-          count += 1;
+    let totalCount = 0;
+    while (pendingSnapshotPairs.size) {
+      const currentPairs = [...pendingSnapshotPairs.values()];
+      pendingSnapshotPairs.clear();
+      const byExchange = new Map();
+      for (const pair of currentPairs) {
+        const exchange = String(pair.exchange || "NSE").toUpperCase();
+        if (!byExchange.has(exchange)) byExchange.set(exchange, []);
+        byExchange.get(exchange).push(String(pair.token));
+      }
+      let count = 0;
+      for (const [exchange, tokens] of byExchange) {
+        const unique = [...new Set(tokens)];
+        for (let offset = 0; offset < unique.length; offset += 50) {
+          const chunk = unique.slice(offset, offset + 50);
+          const response = await fetch("https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/", {
+            method: "POST",
+            headers: quoteHeaders(),
+            body: JSON.stringify({ mode: "FULL", exchangeTokens: { [exchange]: chunk } }),
+          }).catch(error => {
+            console.warn(`Angel snapshot ${exchange} request failed:`, error.message);
+            return null;
+          });
+          if (!response?.ok) {
+            console.warn(`Angel snapshot ${exchange} HTTP ${response?.status || "network"}`);
+            continue;
+          }
+          const payload = await response.json();
+          const rows = Array.isArray(payload?.data?.fetched) ? payload.data.fetched : [];
+          for (const row of rows) {
+            const token = String(row.symbolToken || row.symboltoken || "");
+            const symbol = tokenToSymbol.get(token);
+            const ltp = Number(row.ltp || 0);
+            const close = Number(row.close || row.prevClose || 0);
+            if (!symbol || !Number.isFinite(ltp) || ltp <= 0 || ltp >= 1_000_000) continue;
+            if (close > 0 && (ltp / close <= 0.1 || ltp / close >= 10)) continue;
+            const normalizedTs = angelTimestamp(row.exchFeedTime || row.exchangeTime);
+            prices[symbol] = {
+              ltp,
+              open: Number(row.open || ltp),
+              high: Number(row.high || ltp),
+              low: Number(row.low || ltp),
+              close: close || ltp,
+              volume: Number(row.tradeVolume || row.volume || 0),
+              avgPrice: Number(row.avgPrice || row.averagePrice || 0),
+              ts: normalizedTs,
+            };
+            count += 1;
+          }
         }
       }
+      totalCount += count;
+      console.log(`Snapshot primed ${count}/${currentPairs.length} symbols`);
     }
-    console.log(`Snapshot primed ${count}/${pairs.length} symbols`);
-    return count;
+    return totalCount;
   })().catch(error => {
     console.warn("Angel snapshot prime failed:", error.message);
     return 0;
