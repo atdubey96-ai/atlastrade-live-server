@@ -23,9 +23,14 @@ let aoToken = null;
 let aoFeedToken = null;
 let wsConn = null;
 let wsHeartbeatTimer = null;
+let wsReconnectTimer = null;
 let subscribedTokens = new Set();
 let lastLoginAt = 0;
+let lastTickAt = 0;
+let lastWsOpenAt = 0;
+let wsFailureCount = 0;
 let loginInProgress = false;
+let snapshotInFlight = null;
 
 // ─── TOTP generation (RFC 6238) ──────────────────────────────────────────────
 function base32Decode(str) {
@@ -104,6 +109,10 @@ function connectWebSocket() {
 
   wsConn.on("open", () => {
     console.log("Angel One WebSocket connected");
+    wsFailureCount = 0;
+    lastWsOpenAt = Date.now();
+    clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = null;
     clearInterval(wsHeartbeatTimer);
     wsHeartbeatTimer = setInterval(() => {
       if (wsConn?.readyState === WebSocket.OPEN) wsConn.send("ping");
@@ -129,8 +138,22 @@ function connectWebSocket() {
   wsConn.on("close", (code) => {
     clearInterval(wsHeartbeatTimer);
     wsHeartbeatTimer = null;
-    console.log(`WebSocket closed (${code}), reconnecting in 5s`);
-    setTimeout(connectWebSocket, 5000);
+    wsConn = null;
+    wsFailureCount += 1;
+    console.log(`WebSocket closed (${code}), recovery attempt ${wsFailureCount}`);
+    clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = setTimeout(async () => {
+      wsReconnectTimer = null;
+      // Repeated closes usually mean the JWT/feed token is no longer valid.
+      // Force a fresh login instead of reconnecting forever with stale tokens.
+      if (wsFailureCount >= 3) {
+        aoToken = null;
+        aoFeedToken = null;
+        await ensureLoggedIn(true);
+      } else {
+        connectWebSocket();
+      }
+    }, Math.min(30000, 3000 * wsFailureCount));
   });
 
   wsConn.on("error", (err) => {
@@ -168,6 +191,7 @@ function parseBinaryTick(buf) {
     if (sym && sane) {
       const normalizedExchangeTime = exchangeTime > 1e12 ? exchangeTime : (exchangeTime > 1e9 ? exchangeTime * 1000 : Date.now());
       prices[sym] = { ltp, open, high, low, close, volume, avgPrice, ts: normalizedExchangeTime };
+      lastTickAt = Math.max(lastTickAt, normalizedExchangeTime || Date.now());
     }
   } catch (_) {}
 }
@@ -185,6 +209,81 @@ function subscribe(symbolTokenPairs) {
   if (wsConn?.readyState === WebSocket.OPEN) {
     resubscribeAll();
   }
+}
+
+function quoteHeaders() {
+  return {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "Authorization": `Bearer ${aoToken}`,
+    "X-UserType": "USER",
+    "X-SourceID": "WEB",
+    "X-ClientLocalIP": "127.0.0.1",
+    "X-ClientPublicIP": "127.0.0.1",
+    "X-MACAddress": "00:00:00:00:00:00",
+    "X-PrivateKey": AO_API_KEY,
+  };
+}
+
+function angelTimestamp(value) {
+  const numeric = Number(value || 0);
+  if (Number.isFinite(numeric) && numeric > 0) return numeric > 1e12 ? numeric : numeric * 1000;
+  const parsed = Date.parse(String(value || ""));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+async function primeSnapshots(pairs = []) {
+  if (!aoToken || !pairs.length) return 0;
+  if (snapshotInFlight) return snapshotInFlight;
+  snapshotInFlight = (async () => {
+    const byExchange = new Map();
+    for (const pair of pairs) {
+      const exchange = String(pair.exchange || "NSE").toUpperCase();
+      if (!byExchange.has(exchange)) byExchange.set(exchange, []);
+      byExchange.get(exchange).push(String(pair.token));
+    }
+    let count = 0;
+    for (const [exchange, tokens] of byExchange) {
+      const unique = [...new Set(tokens)];
+      for (let offset = 0; offset < unique.length; offset += 50) {
+        const chunk = unique.slice(offset, offset + 50);
+        const response = await fetch("https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/", {
+          method: "POST",
+          headers: quoteHeaders(),
+          body: JSON.stringify({ mode: "FULL", exchangeTokens: { [exchange]: chunk } }),
+        });
+        if (!response.ok) throw new Error(`Angel snapshot HTTP ${response.status}`);
+        const payload = await response.json();
+        const rows = Array.isArray(payload?.data?.fetched) ? payload.data.fetched : [];
+        for (const row of rows) {
+          const token = String(row.symbolToken || row.symboltoken || "");
+          const symbol = tokenToSymbol.get(token);
+          const ltp = Number(row.ltp || 0);
+          const close = Number(row.close || row.prevClose || 0);
+          if (!symbol || !Number.isFinite(ltp) || ltp <= 0 || ltp >= 1_000_000) continue;
+          if (close > 0 && (ltp / close <= 0.1 || ltp / close >= 10)) continue;
+          const normalizedTs = angelTimestamp(row.exchFeedTime || row.exchangeTime);
+          prices[symbol] = {
+            ltp,
+            open: Number(row.open || ltp),
+            high: Number(row.high || ltp),
+            low: Number(row.low || ltp),
+            close: close || ltp,
+            volume: Number(row.tradeVolume || row.volume || 0),
+            avgPrice: Number(row.avgPrice || row.averagePrice || 0),
+            ts: normalizedTs,
+          };
+          count += 1;
+        }
+      }
+    }
+    console.log(`Snapshot primed ${count}/${pairs.length} symbols`);
+    return count;
+  })().catch(error => {
+    console.warn("Angel snapshot prime failed:", error.message);
+    return 0;
+  }).finally(() => { snapshotInFlight = null; });
+  return snapshotInFlight;
 }
 
 function resubscribeAll() {
@@ -207,18 +306,45 @@ function resubscribeAll() {
 }
 
 // ─── Auto-login and keep-alive ────────────────────────────────────────────────
-async function ensureLoggedIn() {
+async function ensureLoggedIn(force = false) {
   const tokenAge = Date.now() - lastLoginAt;
   // Re-login every 23 hours (tokens expire at 24h)
-  if (!aoToken || tokenAge > 23 * 60 * 60 * 1000) {
+  if (force || !aoToken || tokenAge > 23 * 60 * 60 * 1000) {
     const ok = await loginAngelOne();
-    if (ok) connectWebSocket();
+    if (ok) {
+      connectWebSocket();
+      const tracked = [...symbolToToken.entries()].map(([symbol, value]) => ({ symbol, ...value }));
+      if (tracked.length) primeSnapshots(tracked).catch(() => {});
+    }
   }
 }
 
 // Login on startup, re-login every 23 hours
 ensureLoggedIn();
 setInterval(ensureLoggedIn, 30 * 60 * 1000); // check every 30 min
+
+function isNseMarketOpen(now = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Kolkata", weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false,
+  }).formatToParts(now).reduce((out, part) => (out[part.type] = part.value, out), {});
+  if (parts.weekday === "Sat" || parts.weekday === "Sun") return false;
+  const minutes = Number(parts.hour) * 60 + Number(parts.minute);
+  return minutes >= 9 * 60 + 15 && minutes <= 15 * 60 + 30;
+}
+
+// A connected socket that has stopped producing ticks is not healthy. Recover
+// proactively during market hours instead of waiting for a close event.
+setInterval(async () => {
+  if (!isNseMarketOpen()) return;
+  const tickAge = lastTickAt ? Date.now() - lastTickAt : Infinity;
+  if (wsConn?.readyState === WebSocket.OPEN && tickAge <= 120000) return;
+  console.warn(`Feed watchdog recovery (tick age ${Math.round(tickAge / 1000)}s)`);
+  try { wsConn?.terminate(); } catch (_) {}
+  wsConn = null;
+  aoToken = null;
+  aoFeedToken = null;
+  await ensureLoggedIn(true);
+}, 30000);
 
 // Self-ping every 14 minutes to prevent Render free tier spin-down
 const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
@@ -230,17 +356,26 @@ setInterval(() => {
 
 // Health check
 app.get("/health", (req, res) => {
+  const marketOpen = isNseMarketOpen();
+  const lastTickAgeMs = lastTickAt ? Math.max(0, Date.now() - lastTickAt) : null;
   res.json({
     status: "ok",
     connected: wsConn?.readyState === WebSocket.OPEN,
+    feedHealthy: wsConn?.readyState === WebSocket.OPEN && (!marketOpen || (lastTickAgeMs !== null && lastTickAgeMs <= 120000)),
     loggedIn: !!aoToken,
     trackedSymbols: tokenToSymbol.size,
+    priceCount: Object.keys(prices).length,
+    marketOpen,
+    lastTickAt: lastTickAt ? new Date(lastTickAt).toISOString() : null,
+    lastTickAgeMs,
+    lastWsOpenAt: lastWsOpenAt ? new Date(lastWsOpenAt).toISOString() : null,
     lastLoginAt: lastLoginAt ? new Date(lastLoginAt).toISOString() : null,
   });
 });
 
 // Get live prices for symbols
 app.get("/prices", (req, res) => {
+  res.set("Cache-Control", "no-store, max-age=0");
   const syms = (req.query.symbols || "").split(",").map(s => s.trim()).filter(Boolean);
   if (!syms.length) return res.json(prices);
   const result = {};
@@ -254,7 +389,8 @@ app.post("/subscribe", async (req, res) => {
   if (!Array.isArray(symbols) || !symbols.length) return res.status(400).json({ error: "symbols array required" });
   await ensureLoggedIn();
   subscribe(symbols);
-  res.json({ ok: true, subscribed: symbols.length, total: tokenToSymbol.size });
+  primeSnapshots(symbols).catch(() => {});
+  res.json({ ok: true, subscribed: symbols.length, total: tokenToSymbol.size, connected: wsConn?.readyState === WebSocket.OPEN });
 });
 
 // Fetch live NSE quote (fallback when WebSocket not available)
