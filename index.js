@@ -184,28 +184,34 @@ function parseBinaryTick(buf) {
     const low = hasQuoteFields ? Number(buf.readBigInt64LE(107)) / 100 : 0;
     const close = hasQuoteFields ? Number(buf.readBigInt64LE(115)) / 100 : 0;
 
-    const sym = tokenToSymbol.get(token);
+    const symbols = tokenAliases.get(token) || new Set([tokenToSymbol.get(token)].filter(Boolean));
     const exchangeTime = Number(exchTs);
     const sane = [ltp, open, high, low, close].every(value => Number.isFinite(value) && value >= 0)
       && ltp > 0 && ltp < 1_000_000
       && (!close || (ltp / close > 0.1 && ltp / close < 10));
-    if (sym && sane) {
+    if (symbols.size && sane) {
       const normalizedExchangeTime = exchangeTime > 1e12 ? exchangeTime : (exchangeTime > 1e9 ? exchangeTime * 1000 : Date.now());
-      prices[sym] = { ltp, open, high, low, close, volume, avgPrice, ts: normalizedExchangeTime };
+      symbols.forEach(sym => {
+        prices[sym] = { ltp, open, high, low, close, volume, avgPrice, ts: normalizedExchangeTime };
+      });
       lastTickAt = Math.max(lastTickAt, normalizedExchangeTime || Date.now());
     }
   } catch (_) {}
 }
 
 const tokenToSymbol = new Map(); // token → symbol
+const tokenAliases = new Map();  // token → all saved symbols/aliases using that token
 const symbolToToken = new Map(); // symbol → { token, exchange }
 
 function subscribe(symbolTokenPairs) {
   // symbolTokenPairs: [{ symbol, token, exchange }]
   symbolTokenPairs.forEach(({ symbol, token, exchange }) => {
-    tokenToSymbol.set(String(token), symbol);
-    symbolToToken.set(symbol, { token: String(token), exchange: exchange || "NSE" });
-    subscribedTokens.add(String(token));
+    const tokenKey = String(token);
+    tokenToSymbol.set(tokenKey, symbol);
+    if (!tokenAliases.has(tokenKey)) tokenAliases.set(tokenKey, new Set());
+    tokenAliases.get(tokenKey).add(symbol);
+    symbolToToken.set(symbol, { token: tokenKey, exchange: exchange || "NSE" });
+    subscribedTokens.add(tokenKey);
   });
   if (wsConn?.readyState === WebSocket.OPEN) {
     resubscribeAll();
@@ -269,13 +275,13 @@ async function primeSnapshots(pairs = []) {
           const rows = Array.isArray(payload?.data?.fetched) ? payload.data.fetched : [];
           for (const row of rows) {
             const token = String(row.symbolToken || row.symboltoken || "");
-            const symbol = tokenToSymbol.get(token);
+            const symbols = tokenAliases.get(token) || new Set([tokenToSymbol.get(token)].filter(Boolean));
             const ltp = Number(row.ltp || 0);
             const close = Number(row.close || row.prevClose || 0);
-            if (!symbol || !Number.isFinite(ltp) || ltp <= 0 || ltp >= 1_000_000) continue;
+            if (!symbols.size || !Number.isFinite(ltp) || ltp <= 0 || ltp >= 1_000_000) continue;
             if (close > 0 && (ltp / close <= 0.1 || ltp / close >= 10)) continue;
             const normalizedTs = angelTimestamp(row.exchFeedTime || row.exchangeTime);
-            prices[symbol] = {
+            const normalized = {
               ltp,
               open: Number(row.open || ltp),
               high: Number(row.high || ltp),
@@ -285,7 +291,7 @@ async function primeSnapshots(pairs = []) {
               avgPrice: Number(row.avgPrice || row.averagePrice || 0),
               ts: normalizedTs,
             };
-            count += 1;
+            symbols.forEach(symbol => { prices[symbol] = normalized; count += 1; });
           }
         }
       }
@@ -377,7 +383,8 @@ app.get("/health", (req, res) => {
     connected: wsConn?.readyState === WebSocket.OPEN,
     feedHealthy: wsConn?.readyState === WebSocket.OPEN && (!marketOpen || (lastTickAgeMs !== null && lastTickAgeMs <= 120000)),
     loggedIn: !!aoToken,
-    trackedSymbols: tokenToSymbol.size,
+    trackedSymbols: symbolToToken.size,
+    trackedTokens: tokenToSymbol.size,
     priceCount: Object.keys(prices).length,
     marketOpen,
     lastTickAt: lastTickAt ? new Date(lastTickAt).toISOString() : null,
@@ -404,7 +411,7 @@ app.post("/subscribe", async (req, res) => {
   await ensureLoggedIn();
   subscribe(symbols);
   primeSnapshots(symbols).catch(() => {});
-  res.json({ ok: true, subscribed: symbols.length, total: tokenToSymbol.size, connected: wsConn?.readyState === WebSocket.OPEN });
+  res.json({ ok: true, subscribed: symbols.length, total: symbolToToken.size, tokens: tokenToSymbol.size, connected: wsConn?.readyState === WebSocket.OPEN });
 });
 
 // Fetch live NSE quote (fallback when WebSocket not available)
