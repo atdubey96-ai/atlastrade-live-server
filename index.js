@@ -6,7 +6,7 @@ import express from "express";
 import cors from "cors";
 import fetch from "node-fetch";
 import WebSocket from "ws";
-import { exchangeTimeMs, storeQuote, servableQuotes } from "./price-book.js";
+import { angelFeedTimeMs, exchangeTimeMs, storeQuote, servableQuotes } from "./price-book.js";
 
 const app = express();
 app.use(cors());
@@ -236,10 +236,7 @@ function quoteHeaders() {
 }
 
 function angelTimestamp(value) {
-  const numeric = Number(value || 0);
-  if (Number.isFinite(numeric) && numeric > 0) return numeric > 1e12 ? numeric : numeric * 1000;
-  const parsed = Date.parse(String(value || ""));
-  return Number.isFinite(parsed) ? parsed : 0;
+  return exchangeTimeMs(angelFeedTimeMs(value));
 }
 
 async function primeSnapshots(pairs = []) {

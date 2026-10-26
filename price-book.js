@@ -17,6 +17,20 @@ export function exchangeTimeMs(value, now = Date.now()) {
   return ms;
 }
 
+// Angel One snapshot times are exchange-local (IST) strings with no zone, e.g.
+// "26-Oct-2026 16:08:12". Numbers are epoch seconds or milliseconds.
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+export function angelFeedTimeMs(value) {
+  const numeric = Number(value || 0);
+  if (Number.isFinite(numeric) && numeric > 0) return numeric > 1e12 ? numeric : numeric * 1000;
+  const text = String(value || "").trim();
+  if (!text) return 0;
+  const hasZone = /(?:Z|[+-]\d{2}:?\d{2}|UTC|GMT)$/i.test(text);
+  const parsed = Date.parse(hasZone ? text : `${text} UTC`);
+  if (!Number.isFinite(parsed)) return 0;
+  return hasZone ? parsed : parsed - IST_OFFSET_MS;
+}
+
 // Stores a quote unless it is older than the one already held. Returns true if stored.
 export function storeQuote(book, symbol, quote) {
   const held = book[symbol];

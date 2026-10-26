@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { exchangeTimeMs, storeQuote, servableQuotes } from "./price-book.js";
+import { angelFeedTimeMs, exchangeTimeMs, storeQuote, servableQuotes } from "./price-book.js";
 
 const NOW = Date.parse("2026-10-26T10:40:00Z");
 const H = 60 * 60 * 1000;
@@ -44,4 +44,19 @@ test("on a holiday, last session quotes stay servable", () => {
   const friday = Date.parse("2026-10-23T10:00:00Z");
   const book = { SBIN: { ltp: 958, ts: friday }, HFCL: { ltp: 240, ts: friday - H } };
   assert.deepEqual(Object.keys(servableQuotes(book)).sort(), ["HFCL", "SBIN"]);
+});
+
+test("angelFeedTimeMs reads zone-less snapshot strings as IST", () => {
+  const expected = Date.parse("2026-10-26T10:38:12Z");
+  assert.equal(angelFeedTimeMs("26-Oct-2026 16:08:12"), expected);
+  assert.equal(angelFeedTimeMs("2026-10-26 16:08:12"), expected);
+  assert.equal(angelFeedTimeMs("2026-10-26T10:38:12Z"), expected);
+  assert.equal(angelFeedTimeMs(1793011092), 1793011092000);
+  assert.equal(angelFeedTimeMs(""), 0);
+  assert.equal(angelFeedTimeMs("garbage"), 0);
+});
+
+test("a snapshot stamped in the future is unverified and cannot block live ticks", () => {
+  const farFuture = Date.parse("2026-10-26T16:08:12Z");
+  assert.equal(exchangeTimeMs(farFuture, NOW), 0);
 });
