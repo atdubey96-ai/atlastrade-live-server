@@ -6,6 +6,7 @@ import express from "express";
 import cors from "cors";
 import fetch from "node-fetch";
 import WebSocket from "ws";
+import { exchangeTimeMs, storeQuote, servableQuotes } from "./price-book.js";
 
 const app = express();
 app.use(cors());
@@ -190,11 +191,13 @@ function parseBinaryTick(buf) {
       && ltp > 0 && ltp < 1_000_000
       && (!close || (ltp / close > 0.1 && ltp / close < 10));
     if (symbols.size && sane) {
-      const normalizedExchangeTime = exchangeTime > 1e12 ? exchangeTime : (exchangeTime > 1e9 ? exchangeTime * 1000 : Date.now());
+      // ts stays 0 when the packet has no valid exchange time; it is never stamped
+      // with the server clock, so old pre-open data cannot pass as a live quote.
+      const normalizedExchangeTime = exchangeTimeMs(exchangeTime);
       symbols.forEach(sym => {
-        prices[sym] = { ltp, open, high, low, close, volume, avgPrice, ts: normalizedExchangeTime };
+        storeQuote(prices, sym, { ltp, open, high, low, close, volume, avgPrice, ts: normalizedExchangeTime });
       });
-      lastTickAt = Math.max(lastTickAt, normalizedExchangeTime || Date.now());
+      if (normalizedExchangeTime) lastTickAt = Math.max(lastTickAt, normalizedExchangeTime);
     }
   } catch (_) {}
 }
@@ -291,7 +294,7 @@ async function primeSnapshots(pairs = []) {
               avgPrice: Number(row.avgPrice || row.averagePrice || 0),
               ts: normalizedTs,
             };
-            symbols.forEach(symbol => { prices[symbol] = normalized; count += 1; });
+            symbols.forEach(symbol => { if (storeQuote(prices, symbol, normalized)) count += 1; });
           }
         }
       }
@@ -398,10 +401,15 @@ app.get("/health", (req, res) => {
 app.get("/prices", (req, res) => {
   res.set("Cache-Control", "no-store, max-age=0");
   const syms = (req.query.symbols || "").split(",").map(s => s.trim()).filter(Boolean);
-  if (!syms.length) return res.json(prices);
-  const result = {};
-  syms.forEach(s => { if (prices[s]) result[s] = prices[s]; });
-  res.json(result);
+  // ?debug=1 returns everything held, including quotes withheld as unverified or stale.
+  if (req.query.debug === "1") {
+    if (!syms.length) return res.json(prices);
+    const all = {};
+    syms.forEach(s => { if (prices[s]) all[s] = prices[s]; });
+    return res.json(all);
+  }
+  // Withheld quotes make the website fall back to its verified backup source.
+  res.json(servableQuotes(prices, syms.length ? syms : null));
 });
 
 // Subscribe symbols to live feed
