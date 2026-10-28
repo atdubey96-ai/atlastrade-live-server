@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseSnapPacket, parseRestQuote, storeTick, buildChain, windowTokens, bookKey, resolveContract, quoteView } from "./options.js";
+import { parseSnapPacket, parseRestQuote, storeTick, buildChain, windowTokens, bookKey, resolveContract, quoteView, candleRequest, parseCandles } from "./options.js";
 import { createRequire } from "node:module";
 const M = createRequire(import.meta.url)("./option-math.cjs");
 
@@ -122,4 +122,31 @@ test("a quote view carries price, previous close and spread, and nothing for an 
   const v = quoteView({ ltp: 150.25, close: 145, oi: 5000, volume: 10, ts: NOW, bids: [{ price: 150.2, qty: 5 }], asks: [{ price: 150.3, qty: 5 }] });
   assert.equal(v.ltp, 150.25); assert.equal(v.close, 145); assert.equal(v.bid, 150.2); assert.equal(v.ask, 150.3);
   assert.equal(quoteView({ ltp: 0 }), null); assert.equal(quoteView(undefined), null);
+});
+
+test("a candle request is built for one contract, with IST times, and bad input is refused", () => {
+  const now = Date.parse("2026-10-28T06:00:00Z"); // 11:30 IST
+  const r = candleRequest("53782", "FIVE_MINUTE", now);
+  assert.equal(r.exchange, "NFO"); assert.equal(r.symboltoken, "53782"); assert.equal(r.interval, "FIVE_MINUTE");
+  assert.equal(r.todate, "2026-10-28 11:30"); assert.equal(r.fromdate, "2026-10-18 11:30");
+  assert.equal(candleRequest("53782", "ONE_DAY", now).fromdate, "2025-09-23 11:30");
+  assert.equal(candleRequest("53782; DROP", "ONE_DAY", now), null);
+  assert.equal(candleRequest("53782", "ONE_WEEK", now), null);
+  assert.equal(candleRequest("", "ONE_DAY", now), null);
+});
+
+test("candles are parsed, sorted, and junk rows are dropped", () => {
+  const rows = [
+    ["2026-10-28T09:20:00+05:30", 101, 103, 100, 102, 500],
+    ["2026-10-28T09:15:00+05:30", 100, 102, 99, 101, 800],
+    ["2026-10-28T09:25:00+05:30", 0, 0, 0, 0, 0],
+    ["nonsense"], null,
+    ["2026-10-28T09:30:00+05:30", 102, 101, 103, 102, 10], // high below low
+  ];
+  const c = parseCandles(rows, "FIVE_MINUTE");
+  assert.equal(c.length, 2);
+  assert.equal(c[0].time, "2026-10-28T03:45:00.000Z"); assert.equal(c[0].open, 100); assert.equal(c[1].close, 102);
+  const d = parseCandles([["2026-10-27T00:00:00+05:30", 90, 95, 88, 93, 1000]], "ONE_DAY");
+  assert.equal(d[0].time, "2026-10-27T15:30:00.000Z");
+  assert.deepEqual(parseCandles(undefined, "ONE_DAY"), []);
 });

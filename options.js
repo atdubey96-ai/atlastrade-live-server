@@ -208,3 +208,35 @@ export function quoteView(tick) {
     bid: best(tick.bids), ask: best(tick.asks), oi: tick.oi > 0 ? tick.oi : 0, volume: tick.volume || 0, ts: tick.ts || 0,
   };
 }
+
+// ─── Option candle history ───────────────────────────────────────────────────
+// Angel One's historical API serves futures-and-options contracts too. Intraday intervals are passed through; the site builds
+// weekly and monthly candles from daily ones.
+export const CANDLE_INTERVALS = {
+  ONE_MINUTE: 5, THREE_MINUTE: 10, FIVE_MINUTE: 10, TEN_MINUTE: 20, FIFTEEN_MINUTE: 30, THIRTY_MINUTE: 45, ONE_HOUR: 90, ONE_DAY: 400,
+};
+const IST_MS = 5.5 * 3600 * 1000;
+const pad = n => String(n).padStart(2, "0");
+const istStamp = ms => { const d = new Date(ms + IST_MS); return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`; };
+
+// Returns the body for getCandleData, or null when the token or interval is not acceptable.
+export function candleRequest(token, interval, now = Date.now()) {
+  const days = CANDLE_INTERVALS[interval];
+  if (!/^\d{1,9}$/.test(String(token || "")) || !days) return null;
+  return { exchange: "NFO", symboltoken: String(token), interval, fromdate: istStamp(now - days * 86400000), todate: istStamp(now) };
+}
+
+// rows: [["2026-10-28T09:15:00+05:30", open, high, low, close, volume], ...]. Daily candles carry the trading date at 15:30
+// like the site's other daily history (YYYY-MM-DDT15:30:00.000Z); intraday ones carry their real time.
+export function parseCandles(rows, interval) {
+  const out = [];
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (!Array.isArray(row) || row.length < 6) continue;
+    const at = Date.parse(row[0]);
+    const [open, high, low, close, volume] = row.slice(1, 6).map(Number);
+    if (!Number.isFinite(at) || ![open, high, low, close].every(v => Number.isFinite(v) && v > 0) || high < low) continue;
+    const time = interval === "ONE_DAY" ? `${new Date(at + IST_MS).toISOString().slice(0, 10)}T15:30:00.000Z` : new Date(at).toISOString();
+    out.push({ time, open, high, low, close, volume: Number.isFinite(volume) ? volume : 0 });
+  }
+  return out.sort((a, b) => a.time.localeCompare(b.time));
+}

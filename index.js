@@ -7,7 +7,7 @@ import cors from "cors";
 import fetch from "node-fetch";
 import WebSocket from "ws";
 import { angelFeedTimeMs, exchangeTimeMs, storeQuote, servableQuotes } from "./price-book.js";
-import { parseSnapPacket, parseRestQuote, storeTick, buildChain, windowTokens, bookKey, EXCHANGE_TYPE, resolveContract, quoteView } from "./options.js";
+import { parseSnapPacket, parseRestQuote, storeTick, buildChain, windowTokens, bookKey, EXCHANGE_TYPE, resolveContract, quoteView, candleRequest, parseCandles } from "./options.js";
 
 const app = express();
 app.use(cors());
@@ -609,6 +609,34 @@ app.get("/options/quotes", async (req, res) => {
       quotes[key] = view ? { ...view, symbol: contract.symbol, lotSize: contract.lotSize } : { symbol: contract.symbol, lotSize: contract.lotSize, ltp: null };
     }
     res.json({ quotes, feed: { connected: wsConn?.readyState === WebSocket.OPEN, marketOpen: isNseMarketOpen() } });
+  } catch (error) { res.status(502).json({ error: error.message }); }
+});
+
+// Candle history for one option contract (any expiry), through the same Angel session as the quotes.
+const optionCandleCache = new Map();
+app.get("/options/candles", async (req, res) => {
+  res.set("Cache-Control", "no-store, max-age=0");
+  const token = String(req.query.token || "");
+  const interval = String(req.query.interval || "ONE_DAY").toUpperCase();
+  const body = candleRequest(token, interval);
+  if (!body) return res.status(400).json({ error: "token and a supported interval are required" });
+  const key = `${token}:${interval}`;
+  const ttl = interval === "ONE_DAY" ? 5 * 60 * 1000 : 15 * 1000;
+  const held = optionCandleCache.get(key);
+  if (held && Date.now() - held.at < ttl) return res.json(held.payload);
+  try {
+    await ensureLoggedIn();
+    if (!aoToken) return res.status(503).json({ error: "The broker session is not ready" });
+    const response = await fetch("https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData", {
+      method: "POST", headers: quoteHeaders(), body: JSON.stringify(body), signal: AbortSignal.timeout(20000),
+    });
+    const json = await response.json().catch(() => ({}));
+    if (!response.ok || json.status === false) throw new Error(json.message || `candle history HTTP ${response.status}`);
+    const candles = parseCandles(json.data, interval);
+    const payload = { token, interval, count: candles.length, candles };
+    if (candles.length) optionCandleCache.set(key, { at: Date.now(), payload });
+    if (optionCandleCache.size > 200) optionCandleCache.delete(optionCandleCache.keys().next().value);
+    res.json(payload);
   } catch (error) { res.status(502).json({ error: error.message }); }
 });
 
