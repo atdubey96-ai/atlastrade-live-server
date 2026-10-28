@@ -7,6 +7,7 @@ import cors from "cors";
 import fetch from "node-fetch";
 import WebSocket from "ws";
 import { angelFeedTimeMs, exchangeTimeMs, storeQuote, servableQuotes } from "./price-book.js";
+import { parseSnapPacket, parseRestQuote, storeTick, buildChain, windowTokens, bookKey, EXCHANGE_TYPE, resolveContract, quoteView } from "./options.js";
 
 const app = express();
 app.use(cors());
@@ -123,12 +124,14 @@ function connectWebSocket() {
     if (subscribedTokens.size > 0) {
       resubscribeAll();
     }
+    resubscribeOptions();
   });
 
   wsConn.on("message", (data) => {
     try {
       // Angel One sends binary for live ticks
       if (Buffer.isBuffer(data)) {
+        handleOptionPacket(data);
         parseBinaryTick(data);
       } else {
         const msg = JSON.parse(data.toString());
@@ -169,6 +172,8 @@ function parseBinaryTick(buf) {
     const subscriptionMode = buf.readUInt8(0);
     if (subscriptionMode !== 1 && subscriptionMode !== 2 && subscriptionMode !== 3) return;
     const exchType = buf.readUInt8(1);
+    // Futures and options tokens can equal cash-market tokens; they belong to the option book only.
+    if (exchType === 2 || exchType === 4) return;
     const token = buf.slice(2, 27).toString("utf8").replace(/\0/g, "").trim();
     if (buf.length < 51) return;
     const seqNum = buf.readBigInt64LE(27);
@@ -325,6 +330,106 @@ function resubscribeAll() {
   }
 }
 
+// ─── Option chain feed ───────────────────────────────────────────────────────
+// Option contracts are streamed only while someone is looking at a chain: the strikes around the spot, capped so the
+// shared 1000-token socket limit is never threatened. Quotes live in their own book, keyed by segment and token.
+const SITE_URL = process.env.ZENITH_SITE_URL || "https://atlastrade-portfolio.vercel.app";
+const MAX_OPTION_TOKENS = 360;
+const OPTION_IDLE_MS = 10 * 60 * 1000;
+const optionBook = new Map();
+const optionSubs = new Map(); // bookKey -> { exchange, exchangeType, token, lastUsed }
+const optionStats = { packets: 0, lastPacketAt: 0, lastSample: null, restPrimed: 0, lastError: "" };
+let optionMeta = { at: 0, data: null, loading: null };
+
+function handleOptionPacket(buf) {
+  try {
+    const tick = parseSnapPacket(buf);
+    if (!tick || !optionSubs.has(bookKey(tick.exchangeType, tick.token))) return;
+    if (storeTick(optionBook, tick)) {
+      optionStats.packets += 1;
+      optionStats.lastPacketAt = Date.now();
+      if (optionStats.packets % 200 === 1) optionStats.lastSample = { token: tick.token, exchangeType: tick.exchangeType, mode: tick.mode, ltp: tick.ltp, oi: tick.oi ?? null, oiChangePct: tick.oiChangePct ?? null, bids: tick.bids?.length ?? null, ts: tick.ts };
+    }
+  } catch (_) {}
+}
+
+function sendOptionSubscription(action, entries) {
+  if (!wsConn || wsConn.readyState !== WebSocket.OPEN || !entries.length) return;
+  const byType = new Map();
+  entries.forEach(e => { if (!byType.has(e.exchangeType)) byType.set(e.exchangeType, []); byType.get(e.exchangeType).push(e.token); });
+  const tokenList = [...byType].map(([exchangeType, tokens]) => ({ exchangeType, tokens }));
+  wsConn.send(JSON.stringify({ correlationID: "options", action, params: { mode: 3, tokenList } }));
+}
+
+function resubscribeOptions() {
+  sendOptionSubscription(1, [...optionSubs.values()]);
+}
+
+function trackOptionTokens(list) {
+  const now = Date.now();
+  const fresh = [];
+  for (const item of list) {
+    const key = bookKey(item.exchangeType, item.token);
+    const held = optionSubs.get(key);
+    if (held) { held.lastUsed = now; continue; }
+    const entry = { exchange: item.exchange, exchangeType: item.exchangeType, token: String(item.token), lastUsed: now };
+    optionSubs.set(key, entry);
+    fresh.push(entry);
+  }
+  // Release anything idle, then the least recently used if the cap is still exceeded.
+  const drop = [];
+  for (const [key, entry] of optionSubs) if (now - entry.lastUsed > OPTION_IDLE_MS) drop.push([key, entry]);
+  if (optionSubs.size - drop.length > MAX_OPTION_TOKENS) {
+    const rest = [...optionSubs].filter(([key]) => !drop.some(([k]) => k === key)).sort((a, b) => a[1].lastUsed - b[1].lastUsed);
+    drop.push(...rest.slice(0, optionSubs.size - drop.length - MAX_OPTION_TOKENS));
+  }
+  drop.forEach(([key]) => { optionSubs.delete(key); optionBook.delete(key); });
+  sendOptionSubscription(0, drop.map(([, entry]) => entry));
+  sendOptionSubscription(1, fresh);
+  return fresh;
+}
+
+// One REST snapshot for tokens that have no quote yet, so the chain fills at once instead of waiting for ticks.
+async function primeOptionTokens(list) {
+  if (!aoToken) return 0;
+  const missing = list.filter(item => !optionBook.has(bookKey(item.exchangeType, item.token)));
+  const byExchange = new Map();
+  missing.forEach(item => { if (!byExchange.has(item.exchange)) byExchange.set(item.exchange, []); byExchange.get(item.exchange).push(String(item.token)); });
+  let stored = 0;
+  for (const [exchange, tokens] of byExchange) {
+    for (let offset = 0; offset < tokens.length; offset += 50) {
+      if (offset > 0) await new Promise(resolve => setTimeout(resolve, 1100));
+      const response = await fetch("https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/", {
+        method: "POST", headers: quoteHeaders(),
+        body: JSON.stringify({ mode: "FULL", exchangeTokens: { [exchange]: tokens.slice(offset, offset + 50) } }),
+      }).catch(error => { optionStats.lastError = error.message; return null; });
+      if (!response?.ok) { optionStats.lastError = `snapshot ${exchange} HTTP ${response?.status || "network"}`; continue; }
+      const payload = await response.json().catch(() => ({}));
+      for (const row of Array.isArray(payload?.data?.fetched) ? payload.data.fetched : []) {
+        const tick = parseRestQuote(row, EXCHANGE_TYPE[exchange]);
+        if (tick && storeTick(optionBook, tick)) stored += 1;
+      }
+    }
+  }
+  optionStats.restPrimed += stored;
+  return stored;
+}
+
+async function loadOptionMeta() {
+  const fresh = optionMeta.data && Date.now() - optionMeta.at < 6 * 60 * 60 * 1000;
+  if (fresh) return optionMeta.data;
+  if (optionMeta.loading) return optionMeta.loading;
+  optionMeta.loading = (async () => {
+    const res = await fetch(`${SITE_URL}/api/instruments?source=options`, { signal: AbortSignal.timeout(30000) });
+    if (!res.ok) throw new Error(`contract directory HTTP ${res.status}`);
+    const data = await res.json();
+    if (!data?.underlyings) throw new Error("contract directory looks empty");
+    optionMeta = { at: Date.now(), data, loading: null };
+    return data;
+  })().catch(error => { optionMeta.loading = null; if (optionMeta.data) return optionMeta.data; throw error; });
+  return optionMeta.loading;
+}
+
 // ─── Auto-login and keep-alive ────────────────────────────────────────────────
 async function ensureLoggedIn(force = false) {
   const tokenAge = Date.now() - lastLoginAt;
@@ -430,6 +535,83 @@ app.get("/nse-quote", async (req, res) => {
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
+});
+
+// Option chain: contract directory (expiries per underlying), one chain, and a feed diagnostic.
+app.get("/options/meta", async (req, res) => {
+  res.set("Cache-Control", "public, max-age=300");
+  try {
+    const meta = await loadOptionMeta();
+    res.json({
+      asOf: meta.asOf,
+      underlyings: Object.values(meta.underlyings).map(u => ({
+        name: u.name, label: u.label, lotSize: u.lotSize,
+        expiries: u.expiries.map(e => ({ date: e.date, monthly: e.monthly })),
+      })),
+    });
+  } catch (error) { res.status(502).json({ error: error.message }); }
+});
+
+app.get("/options/chain", async (req, res) => {
+  res.set("Cache-Control", "no-store, max-age=0");
+  try {
+    const meta = await loadOptionMeta();
+    const underlying = String(req.query.underlying || "NIFTY").toUpperCase();
+    const u = meta.underlyings?.[underlying];
+    if (!u) return res.status(404).json({ error: `unknown underlying ${underlying}` });
+    const expiry = String(req.query.expiry || u.expiries[0]?.date || "");
+    const width = Math.min(30, Math.max(5, Number(req.query.width) || 20));
+    await ensureLoggedIn();
+    // The window depends on the spot, so the spot comes first when there is no quote for it yet.
+    const spotItem = { exchange: u.spot.exchange, exchangeType: EXCHANGE_TYPE[u.spot.exchange] || 1, token: u.spot.token };
+    if (!optionBook.has(bookKey(spotItem.exchangeType, spotItem.token))) { trackOptionTokens([spotItem]); await primeOptionTokens([spotItem]); }
+    const spot = optionBook.get(bookKey(spotItem.exchangeType, spotItem.token))?.ltp || null;
+    const wanted = windowTokens({ meta: u, expiry, spot, width });
+    trackOptionTokens(wanted);
+    const missing = wanted.filter(item => !optionBook.has(bookKey(item.exchangeType, item.token)));
+    if (missing.length > wanted.length * 0.3) await primeOptionTokens(missing);
+    const chain = buildChain({ meta: u, expiry, book: optionBook, width });
+    if (!chain) return res.status(404).json({ error: `no ${underlying} expiry ${expiry}` });
+    chain.feed = { connected: wsConn?.readyState === WebSocket.OPEN, marketOpen: isNseMarketOpen(), streamedTokens: optionSubs.size };
+    res.json(chain);
+  } catch (error) { res.status(502).json({ error: error.message }); }
+});
+
+// Live prices for the user's own option positions, in any expiry. items = "NIFTY|2026-11-03|22700|CE,BANKNIFTY|..."
+app.get("/options/quotes", async (req, res) => {
+  res.set("Cache-Control", "no-store, max-age=0");
+  try {
+    const meta = await loadOptionMeta();
+    const items = String(req.query.items || "").split(",").map(x => x.trim()).filter(Boolean).slice(0, 60);
+    if (!items.length) return res.json({ quotes: {} });
+    await ensureLoggedIn();
+    const wanted = [];
+    const found = new Map();
+    for (const key of items) {
+      const [underlying, expiry, strike, type] = key.split("|");
+      const contract = resolveContract(meta.underlyings, underlying, expiry, strike, type);
+      if (contract) { found.set(key, contract); wanted.push(contract); }
+    }
+    trackOptionTokens(wanted);
+    const missing = wanted.filter(item => !optionBook.has(bookKey(item.exchangeType, item.token)));
+    if (missing.length) await primeOptionTokens(missing);
+    const quotes = {};
+    for (const [key, contract] of found) {
+      const view = quoteView(optionBook.get(bookKey(contract.exchangeType, contract.token)));
+      quotes[key] = view ? { ...view, symbol: contract.symbol, lotSize: contract.lotSize } : { symbol: contract.symbol, lotSize: contract.lotSize, ltp: null };
+    }
+    res.json({ quotes, feed: { connected: wsConn?.readyState === WebSocket.OPEN, marketOpen: isNseMarketOpen() } });
+  } catch (error) { res.status(502).json({ error: error.message }); }
+});
+
+app.get("/options/debug", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  res.json({
+    connected: wsConn?.readyState === WebSocket.OPEN, loggedIn: !!aoToken, marketOpen: isNseMarketOpen(),
+    subscribed: optionSubs.size, bookSize: optionBook.size, ...optionStats,
+    lastPacketAgeMs: optionStats.lastPacketAt ? Date.now() - optionStats.lastPacketAt : null,
+    metaAgeMs: optionMeta.at ? Date.now() - optionMeta.at : null,
+  });
 });
 
 app.listen(PORT, () => console.log(`AtlasTrade server running on port ${PORT}`));
