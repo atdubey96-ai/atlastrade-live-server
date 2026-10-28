@@ -398,7 +398,7 @@ async function primeOptionTokens(list) {
   let stored = 0;
   for (const [exchange, tokens] of byExchange) {
     for (let offset = 0; offset < tokens.length; offset += 50) {
-      if (offset > 0) await new Promise(resolve => setTimeout(resolve, 1100));
+      await angelRestGate(offset > 0 ? 1100 : 450);
       const response = await fetch("https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/", {
         method: "POST", headers: quoteHeaders(),
         body: JSON.stringify({ mode: "FULL", exchangeTokens: { [exchange]: tokens.slice(offset, offset + 50) } }),
@@ -612,6 +612,15 @@ app.get("/options/quotes", async (req, res) => {
   } catch (error) { res.status(502).json({ error: error.message }); }
 });
 
+// Angel refuses requests that come too fast ("exceeding access rate"). Calls that serve the option screens share one queue
+// with a minimum gap, so a chart opening while a chain loads does not trip the limit.
+let angelRestAt = 0;
+async function angelRestGate(gap = 450) {
+  const wait = Math.max(0, angelRestAt + gap - Date.now());
+  angelRestAt = Date.now() + wait;
+  if (wait) await new Promise(resolve => setTimeout(resolve, wait));
+}
+
 // Candle history for one option contract (any expiry), through the same Angel session as the quotes.
 const optionCandleCache = new Map();
 app.get("/options/candles", async (req, res) => {
@@ -621,7 +630,7 @@ app.get("/options/candles", async (req, res) => {
   const body = candleRequest(token, interval);
   if (!body) return res.status(400).json({ error: "token and a supported interval are required" });
   const key = `${token}:${interval}`;
-  const ttl = interval === "ONE_DAY" ? 5 * 60 * 1000 : 15 * 1000;
+  const ttl = interval === "ONE_DAY" ? 5 * 60 * 1000 : 45 * 1000;
   const held = optionCandleCache.get(key);
   if (held && Date.now() - held.at < ttl) return res.json(held.payload);
   try {
@@ -630,8 +639,9 @@ app.get("/options/candles", async (req, res) => {
     // Angel limits how fast history can be requested and answers a burst with 403 or an access-rate message; a short pause
     // and a second try clears it.
     let response, json, raw = "";
-    for (let attempt = 0; attempt < 3; attempt++) {
-      if (attempt > 0) await new Promise(resolve => setTimeout(resolve, 1200 * attempt));
+    for (let attempt = 0; attempt < 4; attempt++) {
+      if (attempt > 0) await new Promise(resolve => setTimeout(resolve, 1500 * attempt));
+      await angelRestGate();
       response = await fetch("https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData", {
         method: "POST", headers: quoteHeaders(), body: JSON.stringify(body), signal: AbortSignal.timeout(20000),
       });
