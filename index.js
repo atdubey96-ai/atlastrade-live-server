@@ -7,6 +7,7 @@ import cors from "cors";
 import fetch from "node-fetch";
 import WebSocket from "ws";
 import { angelFeedTimeMs, exchangeTimeMs, storeQuote, servableQuotes } from "./price-book.js";
+import { formatUpdate, dueUpdate, sendTelegram, findChats } from "./telegram.js";
 import { parseSnapPacket, parseRestQuote, storeTick, buildChain, windowTokens, bookKey, EXCHANGE_TYPE, resolveContract, quoteView, candleRequest, parseCandles } from "./options.js";
 
 const app = express();
@@ -668,5 +669,66 @@ app.get("/options/debug", (req, res) => {
     metaAgeMs: optionMeta.at ? Date.now() - optionMeta.at : null,
   });
 });
+
+// ─── Telegram daily updates ──────────────────────────────────────────────────
+// A bot token (TELEGRAM_BOT_TOKEN) and the owner's chat id (TELEGRAM_CHAT_ID, or paired once through /telegram/pair) are
+// needed. Messages go only to that one chat; nothing is read from or acted on from incoming messages.
+const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+let telegramChatId = process.env.TELEGRAM_CHAT_ID || "";
+const telegramSent = {};
+let telegramLastSampleAt = 0;
+
+async function marketSnapshot() {
+  const out = { quotes: {}, chains: {} };
+  try {
+    const res = await fetch(`${SITE_URL}/api/indices?_=${Date.now()}`, { signal: AbortSignal.timeout(20000) });
+    if (res.ok) out.quotes = (await res.json()).quotes || {};
+  } catch (_) {}
+  for (const name of ["NIFTY", "BANKNIFTY"]) {
+    try {
+      const res = await fetch(`http://localhost:${PORT}/options/chain?underlying=${name}&width=12`, { signal: AbortSignal.timeout(30000) });
+      if (res.ok) out.chains[name] = await res.json();
+    } catch (_) {}
+  }
+  return out;
+}
+
+async function sendMarketUpdate(kind) {
+  if (!TELEGRAM_TOKEN || !telegramChatId) throw new Error("Telegram is not set up yet");
+  const { quotes, chains } = await marketSnapshot();
+  if (!Object.keys(quotes).length) throw new Error("Market data is unavailable right now");
+  await sendTelegram(fetch, TELEGRAM_TOKEN, telegramChatId, formatUpdate(kind, quotes, chains));
+}
+
+// Pairs the bot with the one chat that has messaged it. Refuses when several chats did, so a stranger cannot take over.
+app.get("/telegram/pair", async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  if (!TELEGRAM_TOKEN) return res.status(400).json({ error: "TELEGRAM_BOT_TOKEN is not set" });
+  try {
+    if (telegramChatId) return res.json({ paired: true, chatId: Number(telegramChatId) || telegramChatId, note: "already paired" });
+    const chats = await findChats(fetch, TELEGRAM_TOKEN);
+    if (chats.length === 0) return res.status(404).json({ paired: false, error: "No messages found. Open your bot in Telegram, press Start, send 'hi', then try again." });
+    if (chats.length > 1) return res.status(409).json({ paired: false, error: `${chats.length} different chats have messaged the bot; set TELEGRAM_CHAT_ID instead.` });
+    telegramChatId = String(chats[0].id);
+    res.json({ paired: true, chatId: chats[0].id, name: chats[0].name });
+  } catch (error) { res.status(502).json({ error: error.message }); }
+});
+
+// Sends a sample update to the paired chat now (at most one a minute).
+app.get("/telegram/sample", async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  if (Date.now() - telegramLastSampleAt < 60000) return res.status(429).json({ error: "A sample was just sent; wait a minute." });
+  telegramLastSampleAt = Date.now();
+  try { await sendMarketUpdate("sample"); res.json({ sent: true }); }
+  catch (error) { res.status(502).json({ sent: false, error: error.message }); }
+});
+
+setInterval(async () => {
+  const due = dueUpdate(Date.now(), telegramSent);
+  if (!due || !TELEGRAM_TOKEN || !telegramChatId) return;
+  telegramSent[due.kind] = due.iso;
+  try { await sendMarketUpdate(due.kind); console.log(`Telegram ${due.kind} update sent`); }
+  catch (error) { console.warn(`Telegram ${due.kind} update failed:`, error.message); telegramSent[due.kind] = ""; }
+}, 30000);
 
 app.listen(PORT, () => console.log(`AtlasTrade server running on port ${PORT}`));
