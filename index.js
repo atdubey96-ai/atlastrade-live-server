@@ -420,122 +420,23 @@ async function loadOptionMeta() {
   if (fresh) return optionMeta.data;
   if (optionMeta.loading) return optionMeta.loading;
   optionMeta.loading = (async () => {
-    const res = await fetch(`${SITE_URL}/api/instruments?source=options`, { signal: AbortSignal.timeout(30000) });
-    if (!res.ok) throw new Error(`contract directory HTTP ${res.status}`);
-    const data = await res.json();
-    if (!data?.underlyings) throw new Error("contract directory looks empty");
-    optionMeta = { at: Date.now(), data, loading: null };
-    return data;
+    // The live contract list downloads Angel's 36 MB instrument file and is sometimes slow or refused; the copy shipped with
+    // the site is the fallback, so a bad moment there never takes the option chain down.
+    let lastError = null;
+    for (const [path, ms] of [["/api/instruments?source=options", 30000], ["/data/option-contracts.json", 15000]]) {
+      try {
+        const res = await fetch(`${SITE_URL}${path}`, { signal: AbortSignal.timeout(ms) });
+        if (!res.ok) throw new Error(`contract directory HTTP ${res.status}`);
+        const data = await res.json();
+        if (!data?.underlyings) throw new Error("contract directory looks empty");
+        optionMeta = { at: Date.now() - (data.stale || data.snapshot ? 5 * 60 * 60 * 1000 : 0), data, loading: null };
+        return data;
+      } catch (error) { lastError = error; }
+    }
+    throw lastError || new Error("contract directory unavailable");
   })().catch(error => { optionMeta.loading = null; if (optionMeta.data) return optionMeta.data; throw error; });
   return optionMeta.loading;
 }
-
-// ─── Auto-login and keep-alive ────────────────────────────────────────────────
-async function ensureLoggedIn(force = false) {
-  const tokenAge = Date.now() - lastLoginAt;
-  // Re-login every 23 hours (tokens expire at 24h)
-  if (force || !aoToken || tokenAge > 23 * 60 * 60 * 1000) {
-    const ok = await loginAngelOne();
-    if (ok) {
-      connectWebSocket();
-      const tracked = [...symbolToToken.entries()].map(([symbol, value]) => ({ symbol, ...value }));
-      if (tracked.length) primeSnapshots(tracked).catch(() => {});
-    }
-  }
-}
-
-// Login on startup, re-login every 23 hours
-ensureLoggedIn();
-setInterval(ensureLoggedIn, 30 * 60 * 1000); // check every 30 min
-
-function isNseMarketOpen(now = new Date()) {
-  const parts = new Intl.DateTimeFormat("en-GB", {
-    timeZone: "Asia/Kolkata", weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false,
-  }).formatToParts(now).reduce((out, part) => (out[part.type] = part.value, out), {});
-  if (parts.weekday === "Sat" || parts.weekday === "Sun") return false;
-  const minutes = Number(parts.hour) * 60 + Number(parts.minute);
-  return minutes >= 9 * 60 + 15 && minutes <= 15 * 60 + 30;
-}
-
-// A connected socket that has stopped producing ticks is not healthy. Recover
-// proactively during market hours instead of waiting for a close event.
-setInterval(async () => {
-  if (!isNseMarketOpen()) return;
-  const tickAge = lastTickAt ? Date.now() - lastTickAt : Infinity;
-  if (wsConn?.readyState === WebSocket.OPEN && tickAge <= 120000) return;
-  console.warn(`Feed watchdog recovery (tick age ${Math.round(tickAge / 1000)}s)`);
-  try { wsConn?.terminate(); } catch (_) {}
-  wsConn = null;
-  aoToken = null;
-  aoFeedToken = null;
-  await ensureLoggedIn(true);
-}, 30000);
-
-// Self-ping every 14 minutes to prevent Render free tier spin-down
-const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
-setInterval(() => {
-  fetch(`${SELF_URL}/health`).catch(() => {});
-}, 14 * 60 * 1000);
-
-// ─── REST API ────────────────────────────────────────────────────────────────
-
-// Health check
-app.get("/health", (req, res) => {
-  const marketOpen = isNseMarketOpen();
-  const lastTickAgeMs = lastTickAt ? Math.max(0, Date.now() - lastTickAt) : null;
-  res.json({
-    status: "ok",
-    connected: wsConn?.readyState === WebSocket.OPEN,
-    feedHealthy: wsConn?.readyState === WebSocket.OPEN && (!marketOpen || (lastTickAgeMs !== null && lastTickAgeMs <= 120000)),
-    loggedIn: !!aoToken,
-    trackedSymbols: symbolToToken.size,
-    trackedTokens: tokenToSymbol.size,
-    priceCount: Object.keys(prices).length,
-    marketOpen,
-    lastTickAt: lastTickAt ? new Date(lastTickAt).toISOString() : null,
-    lastTickAgeMs,
-    lastWsOpenAt: lastWsOpenAt ? new Date(lastWsOpenAt).toISOString() : null,
-    lastLoginAt: lastLoginAt ? new Date(lastLoginAt).toISOString() : null,
-  });
-});
-
-// Get live prices for symbols
-app.get("/prices", (req, res) => {
-  res.set("Cache-Control", "no-store, max-age=0");
-  const syms = (req.query.symbols || "").split(",").map(s => s.trim()).filter(Boolean);
-  // ?debug=1 returns everything held, including quotes withheld as unverified or stale.
-  if (req.query.debug === "1") {
-    if (!syms.length) return res.json(prices);
-    const all = {};
-    syms.forEach(s => { if (prices[s]) all[s] = prices[s]; });
-    return res.json(all);
-  }
-  // Withheld quotes make the website fall back to its verified backup source.
-  res.json(servableQuotes(prices, syms.length ? syms : null));
-});
-
-// Subscribe symbols to live feed
-app.post("/subscribe", async (req, res) => {
-  const { symbols } = req.body; // [{ symbol, token, exchange }]
-  if (!Array.isArray(symbols) || !symbols.length) return res.status(400).json({ error: "symbols array required" });
-  await ensureLoggedIn();
-  subscribe(symbols);
-  primeSnapshots(symbols).catch(() => {});
-  res.json({ ok: true, subscribed: symbols.length, total: symbolToToken.size, tokens: tokenToSymbol.size, connected: wsConn?.readyState === WebSocket.OPEN });
-});
-
-// Fetch live NSE quote (fallback when WebSocket not available)
-app.get("/nse-quote", async (req, res) => {
-  const { symbols } = req.query;
-  if (!symbols) return res.status(400).json({ error: "symbols required" });
-  try {
-    const r = await fetch(`https://atlastrade-portfolio.vercel.app/api/nse-quote?symbols=${encodeURIComponent(symbols)}`);
-    const data = await r.json();
-    res.json(data);
-  } catch (err) {
-    res.status(502).json({ error: err.message });
-  }
-});
 
 // Option chain: contract directory (expiries per underlying), one chain, and a feed diagnostic.
 app.get("/options/meta", async (req, res) => {
