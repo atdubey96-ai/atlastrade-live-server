@@ -569,7 +569,7 @@ app.get("/options/chain", async (req, res) => {
     const u = meta.underlyings?.[underlying];
     if (!u) return res.status(404).json({ error: `unknown underlying ${underlying}` });
     const expiry = String(req.query.expiry || u.expiries[0]?.date || "");
-    const width = Math.min(30, Math.max(5, Number(req.query.width) || 20));
+    const width = Math.min(60, Math.max(5, Number(req.query.width) || 20));
     await ensureLoggedIn();
     // The window depends on the spot, so the spot comes first when there is no quote for it yet.
     const spotItem = { exchange: u.spot.exchange, exchangeType: EXCHANGE_TYPE[u.spot.exchange] || 1, token: u.spot.token };
