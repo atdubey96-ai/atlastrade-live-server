@@ -29,31 +29,42 @@ function optionLines(chain, name) {
 export function formatUpdate(kind, quotes = {}, chains = {}, now = Date.now()) {
   const t = istParts(now);
   const q = quotes;
-  const title = kind === "morning" ? `☀️ Zenith morning update` : kind === "close" ? `🔔 Zenith market close` : `✅ Zenith sample update`;
+  const titles = { morning: "☀️ Zenith morning update", close: "🔔 Zenith market close", evening: "🌙 Zenith evening update", night: "🌌 Zenith night update", sample: "✅ Zenith sample update" };
+  const title = titles[kind] || titles.sample;
   const section = (heading, lines) => { const kept = lines.filter(Boolean); return kept.length ? ["", heading, ...kept] : []; };
   const optionRows = [...optionLines(chains.NIFTY, "Nifty"), ...optionLines(chains.BANKNIFTY, "Bank Nifty")];
+  const us = kind === "evening" || kind === "night"; // evening and night follow the US session, so global comes first
+  const india = section(kind === "morning" ? "India (previous close / pre-open)" : us ? "India (closed) and GIFT Nifty" : "India", [
+    line(q.nifty50, "Nifty 50    ", 2), line(q.banknifty, "Bank Nifty  ", 2), line(q.sensex, "Sensex      ", 2),
+    kind !== "close" ? line(q.giftNifty, "GIFT Nifty  ", 2) : null,
+  ]);
+  const global = section(us ? "US markets" : "Global", [line(q.sp500, "S&P 500     ", 2), line(q.nasdaq100, "Nasdaq 100  ", 2), line(q.dowjones, "Dow Jones   ", 2)]);
   const rows = [
     `${title} · ${t.weekday} ${t.date}`,
-    ...section(kind === "morning" ? "India (previous close / pre-open)" : "India", [
-      line(q.nifty50, "Nifty 50    ", 2), line(q.banknifty, "Bank Nifty  ", 2), line(q.sensex, "Sensex      ", 2),
-      kind !== "close" ? line(q.giftNifty, "GIFT Nifty  ", 2) : null,
-    ]),
-    ...section("Global", [line(q.sp500, "S&P 500     ", 2), line(q.nasdaq100, "Nasdaq 100  ", 2), line(q.dowjones, "Dow Jones   ", 2)]),
+    ...(us ? [...global, ...india] : [...india, ...global]),
     ...section("Others", [line(q.gold, "Gold BeES   ", 2), line(q.silver, "Silver BeES ", 2), line(q.usdinr, "USD/INR     ", 2), line(q.bitcoin, "Bitcoin $   ", 0), line(q.ethereum, "Ethereum $  ", 0)]),
-    ...section("Options", optionRows),
+    ...(us ? [] : section("Options", [...optionLines(chains.NIFTY, "Nifty"), ...optionLines(chains.BANKNIFTY, "Bank Nifty")])),
     "",
-    kind === "sample" ? "This is a sample. Daily updates: weekdays 9:00 AM and 3:45 PM IST." : "Open Zenith for your portfolio and positions.",
+    kind === "sample" ? "This is a sample. Updates: 9:30 AM, 3:40 PM, 8:10 PM and 2:00 AM IST." : "Open Zenith for your portfolio and positions.",
   ];
   const cleaned = rows;
   return cleaned.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
-// Which scheduled message, if any, is due at this moment: weekdays only, within five minutes after the set time.
+// The daily schedule (India time). days: 0 = Sunday. The 2:00 AM update belongs to the previous evening's US session, so it runs
+// Tuesday to Saturday mornings.
+export const SCHEDULE = [
+  { kind: "morning", at: 9 * 60 + 30, days: [1, 2, 3, 4, 5] },
+  { kind: "close", at: 15 * 60 + 40, days: [1, 2, 3, 4, 5] },
+  { kind: "evening", at: 20 * 60 + 10, days: [1, 2, 3, 4, 5] },
+  { kind: "night", at: 2 * 60, days: [2, 3, 4, 5, 6] },
+];
+
+// Which scheduled message, if any, is due at this moment: on its days, within five minutes after its time, once a day.
 export function dueUpdate(now = Date.now(), sent = {}) {
   const t = istParts(now);
-  if (t.dow === 0 || t.dow === 6) return null;
-  for (const [kind, at] of [["morning", 9 * 60], ["close", 15 * 60 + 45]]) {
-    if (t.minutes >= at && t.minutes < at + 5 && sent[kind] !== t.iso) return { kind, iso: t.iso };
+  for (const { kind, at, days } of SCHEDULE) {
+    if (days.includes(t.dow) && t.minutes >= at && t.minutes < at + 5 && sent[kind] !== t.iso) return { kind, iso: t.iso };
   }
   return null;
 }

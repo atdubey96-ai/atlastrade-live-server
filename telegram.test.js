@@ -26,14 +26,27 @@ test("option lines appear when a chain is given", () => {
   assert.doesNotMatch(text, /GIFT Nifty/); // not in the close message
 });
 
-test("scheduled updates are due only on weekdays at their times, once a day", () => {
-  const at = (iso) => Date.parse(iso);
-  assert.equal(dueUpdate(at("2026-10-28T03:31:00Z"))?.kind, "morning");        // 09:01 IST Wednesday
-  assert.equal(dueUpdate(at("2026-10-28T10:16:00Z"))?.kind, "close");          // 15:46 IST
-  assert.equal(dueUpdate(at("2026-10-28T03:31:00Z"), { morning: "2026-10-28" }), null); // already sent
-  assert.equal(dueUpdate(at("2026-10-28T05:00:00Z")), null);                   // 10:30 IST
-  assert.equal(dueUpdate(at("2026-10-31T03:31:00Z")), null);                   // Saturday
-  assert.equal(dueUpdate(at("2026-10-26T03:31:00Z"))?.kind, "morning");        // Monday
+test("each update is due on its own days and time, once a day", () => {
+  const at = iso => Date.parse(iso);
+  assert.equal(dueUpdate(at("2026-10-28T04:01:00Z"))?.kind, "morning");   // 09:31 IST Wednesday
+  assert.equal(dueUpdate(at("2026-10-28T10:11:00Z"))?.kind, "close");     // 15:41 IST
+  assert.equal(dueUpdate(at("2026-10-28T14:41:00Z"))?.kind, "evening");   // 20:11 IST
+  assert.equal(dueUpdate(at("2026-10-27T20:31:00Z"))?.kind, "night");     // 02:01 IST Wednesday
+  assert.equal(dueUpdate(at("2026-10-28T04:01:00Z"), { morning: "2026-10-28" }), null); // already sent
+  assert.equal(dueUpdate(at("2026-10-28T05:00:00Z")), null);              // 10:30 IST, nothing due
+  assert.equal(dueUpdate(at("2026-10-31T04:01:00Z")), null);              // Saturday 09:31: no morning update
+  assert.equal(dueUpdate(at("2026-10-25T20:31:00Z")), null);              // Monday 02:01 IST: no night update
+  assert.equal(dueUpdate(at("2026-10-30T20:31:00Z"))?.kind, "night");     // Saturday 02:01 IST (after Friday's US session)
+  assert.equal(dueUpdate(at("2026-10-31T20:31:00Z")), null);              // Sunday 02:01 IST
+  assert.equal(dueUpdate(at("2026-10-26T04:01:00Z"))?.kind, "morning");   // Monday
+});
+
+test("the evening and night updates lead with the US markets and leave out the option lines", () => {
+  const chain = { expiry: "2026-11-03", atmStrike: 22700, atmIv: 15.4, pcr: 0.95, maxPain: 22700, straddle: 357.7, expectedMovePct: 1.58 };
+  const text = formatUpdate("evening", quotes, { NIFTY: chain }, NOW);
+  assert.match(text, /Zenith evening update/);
+  assert.ok(text.indexOf("US markets") < text.indexOf("India (closed)"));
+  assert.doesNotMatch(text, /Options/);
 });
 
 test("sending and chat discovery use the Bot API and report its errors", async () => {
