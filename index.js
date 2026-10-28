@@ -627,11 +627,20 @@ app.get("/options/candles", async (req, res) => {
   try {
     await ensureLoggedIn();
     if (!aoToken) return res.status(503).json({ error: "The broker session is not ready" });
-    const response = await fetch("https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData", {
-      method: "POST", headers: quoteHeaders(), body: JSON.stringify(body), signal: AbortSignal.timeout(20000),
-    });
-    const json = await response.json().catch(() => ({}));
-    if (!response.ok || json.status === false) throw new Error(json.message || `candle history HTTP ${response.status}`);
+    // Angel limits how fast history can be requested and answers a burst with 403 or an access-rate message; a short pause
+    // and a second try clears it.
+    let response, json, raw = "";
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) await new Promise(resolve => setTimeout(resolve, 1200 * attempt));
+      response = await fetch("https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData", {
+        method: "POST", headers: quoteHeaders(), body: JSON.stringify(body), signal: AbortSignal.timeout(20000),
+      });
+      raw = await response.text().catch(() => "");
+      json = (() => { try { return JSON.parse(raw); } catch (_) { return {}; } })();
+      if (response.ok && json.status !== false) break;
+      if (!(response.status === 403 || response.status === 429 || /rate|exceed/i.test(String(json.message || raw)))) break;
+    }
+    if (!response.ok || json.status === false) throw new Error(`${json.message || raw.replace(/\s+/g, " ").slice(0, 160) || "candle history"} (HTTP ${response.status})`);
     const candles = parseCandles(json.data, interval);
     const payload = { token, interval, count: candles.length, candles };
     if (candles.length) optionCandleCache.set(key, { at: Date.now(), payload });
