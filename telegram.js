@@ -25,8 +25,55 @@ function optionLines(chain, name) {
   return [`📊 ${parts.join(" · ")}`];
 }
 
+// ── Holdings summary ───────────────────────────────────────────────────────────
+const inr = (n, signed = false) => {
+  if (!Number.isFinite(n)) return "–";
+  const a = Math.abs(n), sign = n < 0 ? "−" : signed ? "+" : "";
+  const body = a >= 1e7 ? (a / 1e7).toFixed(2) + " Cr" : a >= 1e5 ? (a / 1e5).toFixed(2) + " L" : a >= 1e3 ? (a / 1e3).toFixed(1) + "K" : Math.round(a).toString();
+  return `${sign}₹${body}`;
+};
+const pctText = p => (Number.isFinite(p) ? `${p >= 0 ? "+" : "−"}${Math.abs(p).toFixed(2)}%` : "–");
+
+// holdings: the site's saved holdings. quoteOf(symbol) -> { ltp, prev } or null. Only Indian-listed holdings are summed; funds, US stocks
+// and crypto have no quote from the exchange feed here, so they are left out instead of guessed.
+export function summarizeHoldings(holdings, quoteOf) {
+  const out = { count: 0, skipped: 0, value: 0, invested: 0, day: 0, rows: [] };
+  for (const h of holdings || []) {
+    const symbol = String(h?.symbol || "");
+    const qty = Number(h?.qty), avg = Number(h?.avg);
+    if (!symbol || !(qty > 0) || /-(MF|US|CX)$/i.test(symbol)) { if (symbol && qty > 0) out.skipped++; continue; }
+    const q = quoteOf(symbol);
+    if (!q || !(q.ltp > 0)) { out.skipped++; continue; }
+    const prev = q.prev > 0 ? q.prev : q.ltp;
+    const day = qty * (q.ltp - prev);
+    out.count++; out.value += qty * q.ltp; out.invested += qty * avg; out.day += day;
+    out.rows.push({ symbol: symbol.replace(/-(EQ|BE|BZ|SM|ST)$/i, ""), day, dayPct: (q.ltp / prev - 1) * 100 });
+  }
+  out.pnl = out.value - out.invested;
+  out.pnlPct = out.invested > 0 ? out.pnl / out.invested * 100 : NaN;
+  const prevValue = out.value - out.day;
+  out.dayPct = prevValue > 0 ? out.day / prevValue * 100 : NaN;
+  const byDay = out.rows.slice().sort((a, b) => b.day - a.day);
+  out.best = byDay.filter(r => r.day > 0).slice(0, 3);
+  out.worst = byDay.slice().reverse().filter(r => r.day < 0).slice(0, 3);
+  return out;
+}
+
+export function holdingsLines(s) {
+  if (!s || !s.count) return [];
+  const mover = r => `${r.symbol} ${inr(r.day, true)} (${pctText(r.dayPct)})`;
+  return [
+    `💼 Holdings · ${s.count} Indian stocks`,
+    `Value ${inr(s.value)} · Invested ${inr(s.invested)}`,
+    `${arrow(s.pnl)} Total P&L ${inr(s.pnl, true)} (${pctText(s.pnlPct)})`,
+    `${arrow(s.day)} Today ${inr(s.day, true)} (${pctText(s.dayPct)})`,
+    ...(s.best.length ? [`▲ ${s.best.map(mover).join(" · ")}`] : []),
+    ...(s.worst.length ? [`▼ ${s.worst.map(mover).join(" · ")}`] : []),
+  ];
+}
+
 // quotes: the site's /api/indices "quotes" object. chains: { NIFTY, BANKNIFTY } from the option chain, each optional.
-export function formatUpdate(kind, quotes = {}, chains = {}, now = Date.now()) {
+export function formatUpdate(kind, quotes = {}, chains = {}, now = Date.now(), holdings = []) {
   const t = istParts(now);
   const q = quotes;
   const titles = { morning: "☀️ Zenith morning update", close: "🔔 Zenith market close", evening: "🌙 Zenith evening update", night: "🌌 Zenith night update", sample: "✅ Zenith sample update" };
@@ -43,6 +90,7 @@ export function formatUpdate(kind, quotes = {}, chains = {}, now = Date.now()) {
     `${title} · ${t.weekday} ${t.date}`,
     ...(us ? [...global, ...india] : [...india, ...global]),
     ...section("Others", [line(q.gold, "Gold BeES   ", 2), line(q.silver, "Silver BeES ", 2), line(q.usdinr, "USD/INR     ", 2), line(q.bitcoin, "Bitcoin $   ", 0), line(q.ethereum, "Ethereum $  ", 0)]),
+    ...(holdings.length ? ["", ...holdings] : []),
     ...(us ? [] : section("Options", [...optionLines(chains.NIFTY, "Nifty"), ...optionLines(chains.BANKNIFTY, "Bank Nifty")])),
     "",
     kind === "sample" ? "This is a sample. Updates: 9:30 AM, 3:40 PM, 8:10 PM and 2:00 AM IST." : "Open Zenith for your portfolio and positions.",
@@ -50,6 +98,16 @@ export function formatUpdate(kind, quotes = {}, chains = {}, now = Date.now()) {
   const cleaned = rows;
   return cleaned.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
+
+// A scheduled India-session message (morning, close) is skipped on an NSE holiday. A holiday is only declared when nothing says the market
+// traded today: no exchange tick has arrived since midnight IST and the Nifty's latest 5-minute candle is not from today.
+export function isIndiaTradingDay({ now = Date.now(), lastTickAt = 0, latestCandleMs = 0 } = {}) {
+  const dayStart = Math.floor((now + 5.5 * 3600 * 1000) / 86400000) * 86400000 - 5.5 * 3600 * 1000;
+  if (lastTickAt >= dayStart) return true;
+  if (latestCandleMs >= dayStart) return true;
+  return false;
+}
+export const INDIA_SESSION_KINDS = new Set(["morning", "close"]);
 
 // The daily schedule (India time). days: 0 = Sunday. The 2:00 AM update belongs to the previous evening's US session, so it runs
 // Tuesday to Saturday mornings.

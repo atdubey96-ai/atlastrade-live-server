@@ -7,7 +7,7 @@ import cors from "cors";
 import fetch from "node-fetch";
 import WebSocket from "ws";
 import { angelFeedTimeMs, exchangeTimeMs, storeQuote, servableQuotes, staleSymbols } from "./price-book.js";
-import { formatUpdate, dueUpdate, sendTelegram, findChats } from "./telegram.js";
+import { formatUpdate, dueUpdate, sendTelegram, findChats, summarizeHoldings, holdingsLines, isIndiaTradingDay, INDIA_SESSION_KINDS } from "./telegram.js";
 import { parseSnapPacket, parseRestQuote, storeTick, buildChain, windowTokens, bookKey, EXCHANGE_TYPE, resolveContract, quoteView, candleRequest, parseCandles } from "./options.js";
 
 const app = express();
@@ -703,11 +703,58 @@ async function marketSnapshot() {
   return out;
 }
 
+// Your saved holdings, read from the site's own storage endpoint and kept for five minutes.
+let holdingsCache = { at: 0, list: [] };
+async function savedHoldings() {
+  if (Date.now() - holdingsCache.at < 5 * 60 * 1000) return holdingsCache.list;
+  try {
+    const res = await fetch(`${SITE_URL}/api/sync?url=server-managed&key=live-server&table=scada_reports&filename=atlastrade_portfolio_state.json`, { signal: AbortSignal.timeout(25000) });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const rows = await res.json();
+    const state = JSON.parse(Buffer.from(String(rows?.[0]?.data_base64 || ""), "base64").toString("utf8"));
+    holdingsCache = { at: Date.now(), list: Array.isArray(state.holdings) ? state.holdings : [] };
+  } catch (error) { console.warn("Holdings unavailable for Telegram:", error.message); }
+  return holdingsCache.list;
+}
+
+// Holdings priced from the live feed, with the exchange's own previous close for today's change.
+async function holdingsSummaryLines() {
+  const holdings = await savedHoldings();
+  if (!holdings.length) return [];
+  const symbols = [...new Set(holdings.map(h => String(h.symbol || "")).filter(s => s && !/-(MF|US|CX)$/i.test(s)))];
+  const official = {};
+  for (let i = 0; i < symbols.length; i += 150) {
+    try {
+      const res = await fetch(`${SITE_URL}/api/indices?route=official-close&symbols=${encodeURIComponent(symbols.slice(i, i + 150).join(","))}`, { signal: AbortSignal.timeout(20000) });
+      if (res.ok) Object.assign(official, await res.json());
+    } catch (_) {}
+  }
+  const live = servableQuotes(prices, symbols);
+  const quoteOf = symbol => {
+    const q = live[symbol], o = official[symbol];
+    if (q && q.ltp > 0) return { ltp: q.ltp, prev: o && o.prevClose > 0 ? o.prevClose : q.close };
+    return o && o.close > 0 ? { ltp: o.close, prev: o.prevClose } : null; // no live tick: the last official close
+  };
+  return holdingsLines(summarizeHoldings(holdings, quoteOf));
+}
+
 async function sendMarketUpdate(kind) {
   if (!TELEGRAM_TOKEN || !telegramChatId) throw new Error("Telegram is not set up yet");
   const { quotes, chains } = await marketSnapshot();
   if (!Object.keys(quotes).length) throw new Error("Market data is unavailable right now");
-  await sendTelegram(fetch, TELEGRAM_TOKEN, telegramChatId, formatUpdate(kind, quotes, chains));
+  const holdings = await holdingsSummaryLines().catch(() => []);
+  await sendTelegram(fetch, TELEGRAM_TOKEN, telegramChatId, formatUpdate(kind, quotes, chains, Date.now(), holdings));
+}
+
+// True when the market traded today (or when that cannot be told: a missed message is worse than an extra one).
+async function indiaTradedToday() {
+  let latestCandleMs = 0;
+  try {
+    const res = await fetch(`${SITE_URL}/api/historical?symbol=${encodeURIComponent("NIFTY 50")}&interval=FIVE_MINUTE&_=${Date.now()}`, { signal: AbortSignal.timeout(20000) });
+    if (res.ok) { const c = (await res.json()).candles || []; latestCandleMs = c.length ? Date.parse(c[c.length - 1].time) : 0; }
+    else return true;
+  } catch (_) { return true; }
+  return isIndiaTradingDay({ now: Date.now(), lastTickAt, latestCandleMs });
 }
 
 // Pairs the bot with the one chat that has messaged it. Refuses when several chats did, so a stranger cannot take over.
@@ -737,6 +784,8 @@ setInterval(async () => {
   const due = dueUpdate(Date.now(), telegramSent);
   if (!due || !TELEGRAM_TOKEN || !telegramChatId) return;
   telegramSent[due.kind] = due.iso;
+  // The India-session messages are not sent on an NSE holiday.
+  if (INDIA_SESSION_KINDS.has(due.kind) && !(await indiaTradedToday())) { console.log(`Telegram ${due.kind} update skipped: NSE is closed today`); return; }
   try { await sendMarketUpdate(due.kind); console.log(`Telegram ${due.kind} update sent`); }
   catch (error) { console.warn(`Telegram ${due.kind} update failed:`, error.message); telegramSent[due.kind] = ""; }
 }, 30000);
