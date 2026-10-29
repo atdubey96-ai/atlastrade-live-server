@@ -6,7 +6,7 @@ import express from "express";
 import cors from "cors";
 import fetch from "node-fetch";
 import WebSocket from "ws";
-import { angelFeedTimeMs, exchangeTimeMs, storeQuote, servableQuotes } from "./price-book.js";
+import { angelFeedTimeMs, exchangeTimeMs, storeQuote, servableQuotes, staleSymbols } from "./price-book.js";
 import { formatUpdate, dueUpdate, sendTelegram, findChats } from "./telegram.js";
 import { parseSnapPacket, parseRestQuote, storeTick, buildChain, windowTokens, bookKey, EXCHANGE_TYPE, resolveContract, quoteView, candleRequest, parseCandles } from "./options.js";
 
@@ -479,6 +479,16 @@ setInterval(async () => {
   aoFeedToken = null;
   await ensureLoggedIn(true);
 }, 30000);
+
+// Quotes that stopped updating (a frozen socket token, or a pre-open replay) are re-read from the REST snapshot once a minute,
+// so a wrong price cannot sit in the book for hours. Rate-limited by the shared REST gate inside primeSnapshots.
+setInterval(() => {
+  if (!aoToken) return;
+  const open = isNseMarketOpen();
+  const symbols = staleSymbols(prices, { marketOpen: open, limit: open ? 100 : 40 });
+  const pairs = symbols.map(symbol => { const info = symbolToToken.get(symbol); return info ? { symbol, token: info.token, exchange: info.exchange } : null; }).filter(Boolean);
+  if (pairs.length) primeSnapshots(pairs).catch(() => {});
+}, 60000);
 
 // Self-ping every 14 minutes to prevent Render free tier spin-down
 const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
