@@ -88,9 +88,23 @@ export function storeTick(book, tick) {
 
 const round = (v, d = 2) => (Number.isFinite(v) ? +v.toFixed(d) : null);
 
+// The price a contract is worth right now. The last traded price can be hours older than the live quote (deep in-the-money
+// strikes trade rarely), which puts it outside the bid and ask. When the book is tight and the last price sits outside it, the
+// mid of the book is the fair value; otherwise the last traded price stands. Implied volatility and Greeks are read from this.
+export function effectivePrice(tick) {
+  const ltp = tick?.ltp > 0 ? tick.ltp : 0;
+  const top = list => (Array.isArray(list) && list[0] && list[0].price > 0 ? list[0].price : 0);
+  const bid = top(tick?.bids), ask = top(tick?.asks);
+  if (bid > 0 && ask >= bid && ask / bid <= 1.3) {
+    if (!ltp || ltp < bid * 0.995 || ltp > ask * 1.005) return round((bid + ask) / 2);
+  }
+  return ltp;
+}
+
 function legView(ref, tick, extra) {
   if (!ref) return null;
   const ltp = tick?.ltp > 0 ? tick.ltp : 0;
+  const px = effectivePrice(tick);
   const close = tick?.close > 0 ? tick.close : 0;
   const pct = Number.isFinite(tick?.oiChangePct) ? tick.oiChangePct : null;
   const oi = tick?.oi > 0 ? tick.oi : 0;
@@ -98,9 +112,10 @@ function legView(ref, tick, extra) {
   const bid = best(tick?.bids), ask = best(tick?.asks);
   return {
     token: ref.token, symbol: ref.symbol,
-    ltp: ltp || null,
-    chg: ltp && close ? round(ltp - close) : null,
-    chgPct: ltp && close ? round((ltp / close - 1) * 100) : null,
+    // ltp is the contract's fair price now (see effectivePrice); last is the raw last traded price, shown only when it differs.
+    ltp: px || null, last: ltp || null, stale: !!(ltp && px && Math.abs(px / ltp - 1) > 0.005),
+    chg: px && close ? round(px - close) : null,
+    chgPct: px && close ? round((px / close - 1) * 100) : null,
     oi, oiChg: pct !== null && oi ? Math.round(oi - oi / (1 + pct / 100)) : null,
     volume: tick?.volume || 0,
     bid: bid ? round(bid.price) : null, bidQty: bid?.qty ?? null, ask: ask ? round(ask.price) : null, askQty: ask?.qty ?? null,
@@ -128,7 +143,7 @@ export function buildChain({ meta, expiry, book, now = Date.now(), width = 20 })
   const slice = strikes.slice(from, to);
 
   const T = M.yearsToExpiry(expiry, now);
-  const preRows = slice.map(s => ({ strike: s.k, ce: { ltp: tickOf(s.ce)?.ltp || 0 }, pe: { ltp: tickOf(s.pe)?.ltp || 0 } }));
+  const preRows = slice.map(s => ({ strike: s.k, ce: { ltp: effectivePrice(tickOf(s.ce)) }, pe: { ltp: effectivePrice(tickOf(s.pe)) } }));
   const forward = M.impliedForward(preRows, T) || (spot ? spot * Math.exp(M.RATE * T) : null);
 
   const rows = slice.map(s => {
@@ -138,10 +153,12 @@ export function buildChain({ meta, expiry, book, now = Date.now(), width = 20 })
       // Implied volatility is read from the out-of-the-money option of each strike, then used for both sides.
       const otmIsCall = s.k >= forward;
       const otm = otmIsCall ? ceTick : peTick;
-      iv = otm?.ltp > 0 ? M.impliedVol(otmIsCall ? "CE" : "PE", otm.ltp, forward, s.k, T) : null;
+      const otmPx = effectivePrice(otm);
+      iv = otmPx > 0 ? M.impliedVol(otmIsCall ? "CE" : "PE", otmPx, forward, s.k, T) : null;
       if (iv === null) {
         const itm = otmIsCall ? peTick : ceTick;
-        iv = itm?.ltp > 0 ? M.impliedVol(otmIsCall ? "PE" : "CE", itm.ltp, forward, s.k, T) : null;
+        const itmPx = effectivePrice(itm);
+        iv = itmPx > 0 ? M.impliedVol(otmIsCall ? "PE" : "CE", itmPx, forward, s.k, T) : null;
       }
     }
     const g = type => (iv && forward ? M.greeks(type, forward, s.k, T, iv) : null);
@@ -155,7 +172,7 @@ export function buildChain({ meta, expiry, book, now = Date.now(), width = 20 })
   });
 
   let atm = rows.length ? rows[Math.min(rows.length - 1, Math.max(0, centre - from))] : null;
-  const straddle = atm?.ce?.ltp && atm?.pe?.ltp ? round(atm.ce.ltp + atm.pe.ltp) : null;
+  const straddle = (atm?.ce?.px || atm?.ce?.ltp) && (atm?.pe?.px || atm?.pe?.ltp) ? round((atm.ce.px || atm.ce.ltp) + (atm.pe.px || atm.pe.ltp)) : null;
   const newest = rows.reduce((t, r) => Math.max(t, r.ce?.ts || 0, r.pe?.ts || 0), spotTick?.ts || 0);
 
   return {
@@ -204,7 +221,7 @@ export function quoteView(tick) {
   if (!tick || !(tick.ltp > 0)) return null;
   const best = list => (Array.isArray(list) && list[0] && list[0].price > 0 ? round(list[0].price) : null);
   return {
-    ltp: round(tick.ltp), close: tick.close > 0 ? round(tick.close) : null,
+    ltp: round(effectivePrice(tick) || tick.ltp), last: round(tick.ltp), close: tick.close > 0 ? round(tick.close) : null,
     bid: best(tick.bids), ask: best(tick.asks), oi: tick.oi > 0 ? tick.oi : 0, volume: tick.volume || 0, ts: tick.ts || 0,
   };
 }

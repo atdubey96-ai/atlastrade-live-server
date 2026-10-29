@@ -150,3 +150,23 @@ test("candles are parsed, sorted, and junk rows are dropped", () => {
   assert.equal(d[0].time, "2026-10-27T15:30:00.000Z");
   assert.deepEqual(parseCandles(undefined, "ONE_DAY"), []);
 });
+
+test("effectivePrice: a last price outside a tight book gives way to the mid, a price inside it stands", async () => {
+  const { effectivePrice } = await import("./options.js");
+  const book = (b, a) => ({ bids: [{ price: b, qty: 1 }], asks: [{ price: a, qty: 1 }] });
+  assert.equal(effectivePrice({ ltp: 2317.55, ...book(2657.1, 2718.6) }), 2687.85);   // stale deep in-the-money print
+  assert.equal(effectivePrice({ ltp: 410.65, ...book(410.0, 411.75) }), 410.65);      // inside the book
+  assert.equal(effectivePrice({ ltp: 100, ...book(50, 100) }), 100);                  // wide book is not trusted
+  assert.equal(effectivePrice({ ltp: 55 }), 55);                                      // no book
+  assert.equal(effectivePrice({ ltp: 0, ...book(20, 21) }), 20.5);                    // no trade yet, quote exists
+  assert.equal(effectivePrice(null), 0);
+});
+
+test("chain legs carry the fair price as ltp and keep the raw last price", async () => {
+  const { quoteView } = await import("./options.js");
+  const q = quoteView({ ltp: 2317.55, close: 2000, bids: [{ price: 2657.1, qty: 1 }], asks: [{ price: 2718.6, qty: 1 }] });
+  assert.equal(q.ltp, 2687.85);
+  assert.equal(q.last, 2317.55);
+  const quiet = quoteView({ ltp: 100.5, close: 99, bids: [{ price: 100, qty: 1 }], asks: [{ price: 101, qty: 1 }] });
+  assert.equal(quiet.ltp, 100.5);
+});
