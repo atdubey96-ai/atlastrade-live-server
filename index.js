@@ -2,6 +2,7 @@
 // Maintains Angel One WebSocket 24/7, serves live prices via REST API
 // Deploy on Render.com free tier
 
+import { symbolsForTick, EXCHANGE_BY_TYPE } from "./token-book.js";
 import express from "express";
 import cors from "cors";
 import fetch from "node-fetch";
@@ -191,7 +192,7 @@ function parseBinaryTick(buf) {
     const low = hasQuoteFields ? Number(buf.readBigInt64LE(107)) / 100 : 0;
     const close = hasQuoteFields ? Number(buf.readBigInt64LE(115)) / 100 : 0;
 
-    const symbols = tokenAliases.get(token) || new Set([tokenToSymbol.get(token)].filter(Boolean));
+    const symbols = symbolsForTick(tokenAliases, tokenToSymbol, symbolToToken, token, EXCHANGE_BY_TYPE[exchType]);
     const exchangeTime = Number(exchTs);
     const sane = [ltp, open, high, low, close].every(value => Number.isFinite(value) && value >= 0)
       && ltp > 0 && ltp < 1_000_000
@@ -281,7 +282,7 @@ async function primeSnapshots(pairs = []) {
           const rows = Array.isArray(payload?.data?.fetched) ? payload.data.fetched : [];
           for (const row of rows) {
             const token = String(row.symbolToken || row.symboltoken || "");
-            const symbols = tokenAliases.get(token) || new Set([tokenToSymbol.get(token)].filter(Boolean));
+            const symbols = symbolsForTick(tokenAliases, tokenToSymbol, symbolToToken, token, exchange === "BSE" || exchange === "NSE" ? exchange : undefined);
             const ltp = Number(row.ltp || 0);
             const close = Number(row.close || row.prevClose || 0);
             if (!symbols.size || !Number.isFinite(ltp) || ltp <= 0 || ltp >= 1_000_000) continue;
