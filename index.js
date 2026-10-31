@@ -11,6 +11,7 @@ import cors from "cors";
 import fetch from "node-fetch";
 import WebSocket from "ws";
 import { angelFeedTimeMs, exchangeTimeMs, storeQuote, servableQuotes, staleSymbols } from "./price-book.js";
+import { evaluate as evaluateHealth, emptyState as healthState } from "./health-monitor.js";
 import { formatUpdate, dueUpdate, sendTelegram, findChats, summarizeHoldings, holdingsLines, isIndiaTradingDay, INDIA_SESSION_KINDS } from "./telegram.js";
 import { parseSnapPacket, parseRestQuote, storeTick, buildChain, windowTokens, bookKey, EXCHANGE_TYPE, resolveContract, quoteView, candleRequest, parseCandles } from "./options.js";
 
@@ -703,11 +704,11 @@ let holdingsCache = { at: 0, list: [] };
 async function savedHoldings() {
   if (Date.now() - holdingsCache.at < 5 * 60 * 1000) return holdingsCache.list;
   try {
-    const res = await fetch(`${SITE_URL}/api/sync?url=server-managed&key=live-server&table=scada_reports&filename=atlastrade_portfolio_state.json`, { signal: AbortSignal.timeout(25000) });
+    // The site no longer serves portfolios to anonymous callers; this service reads a minimal holdings list with its scoped token.
+    const res = await fetch(`${SITE_URL}/api/indices?route=holdings`, { headers: { Authorization: `Bearer ${process.env.LIVE_SERVICE_TOKEN || ""}` }, signal: AbortSignal.timeout(25000) });
     if (!res.ok) throw new Error("HTTP " + res.status);
-    const rows = await res.json();
-    const state = JSON.parse(Buffer.from(String(rows?.[0]?.data_base64 || ""), "base64").toString("utf8"));
-    holdingsCache = { at: Date.now(), list: Array.isArray(state.holdings) ? state.holdings : [] };
+    const body = await res.json();
+    holdingsCache = { at: Date.now(), list: Array.isArray(body?.holdings) ? body.holdings : [] };
   } catch (error) { console.warn("Holdings unavailable for Telegram:", error.message); }
   return holdingsCache.list;
 }
@@ -790,6 +791,24 @@ app.listen(PORT, () => console.log(`AtlasTrade server running on port ${PORT}`))
 subscriptionPersistence.restore().catch(()=>{});
 const persistenceRecovery = setInterval(()=>{if(subscriptionPersistenceStatus==='restore-failed')subscriptionPersistence.restore().catch(()=>{});},60000);
 persistenceRecovery.unref?.();
+
+// Feed alerts: every 5 minutes the site's own data-health report is read; a source that stays unhealthy for two checks in a row is
+// reported once on Telegram (and once more when it recovers). Nothing is sent when Telegram is not set up.
+let healthMonitorState = healthState();
+async function runHealthMonitor() {
+  try {
+    const res = await fetch(`${SITE_URL}/api/indices?route=health`, { signal: AbortSignal.timeout(25000) });
+    if (!res.ok) return;
+    const out = evaluateHealth(healthMonitorState, await res.json());
+    healthMonitorState = out.state;
+    for (const text of out.messages) {
+      console.warn("Feed alert:", text);
+      if (TELEGRAM_TOKEN && telegramChatId) await sendTelegram(fetch, TELEGRAM_TOKEN, telegramChatId, text).catch(error => console.warn("Feed alert not sent:", error.message));
+    }
+  } catch (error) { console.warn("Health monitor check failed:", error.message); }
+}
+const healthMonitorTimer = setInterval(runHealthMonitor, 5 * 60 * 1000);
+healthMonitorTimer.unref?.();
 
 async function refreshTradingCalendar(){try{const r=await fetch(`${SITE_URL}/api/indices?route=calendar`,{signal:AbortSignal.timeout(15000)});if(r.ok)marketCalendar.applyCalendar(await r.json());}catch{}}
 refreshTradingCalendar();const calendarTimer=setInterval(refreshTradingCalendar,6*3600000);calendarTimer.unref?.();
