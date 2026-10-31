@@ -11,6 +11,7 @@ import cors from "cors";
 import fetch from "node-fetch";
 import WebSocket from "ws";
 import { angelFeedTimeMs, exchangeTimeMs, storeQuote, servableQuotes, staleSymbols } from "./price-book.js";
+import { createGapWatch, openedAtIst } from "./gap-watch.js";
 import { evaluate as evaluateHealth, emptyState as healthState } from "./health-monitor.js";
 import { formatUpdate, dueUpdate, sendTelegram, findChats, summarizeHoldings, holdingsLines, isIndiaTradingDay, INDIA_SESSION_KINDS } from "./telegram.js";
 import { parseSnapPacket, parseRestQuote, storeTick, buildChain, windowTokens, bookKey, EXCHANGE_TYPE, resolveContract, quoteView, candleRequest, parseCandles } from "./options.js";
@@ -206,13 +207,15 @@ function parseBinaryTick(buf) {
       // with the server clock, so old pre-open data cannot pass as a live quote.
       const normalizedExchangeTime = exchangeTimeMs(exchangeTime);
       symbols.forEach(sym => {
-        storeQuote(prices, sym, { ltp, open, high, low, close, volume, avgPrice, ts: normalizedExchangeTime });
+        if (storeQuote(prices, sym, { ltp, open, high, low, close, volume, avgPrice, ts: normalizedExchangeTime })) gapWatch.observe(sym, normalizedExchangeTime);
       });
       if (normalizedExchangeTime) lastTickAt = Math.max(lastTickAt, normalizedExchangeTime);
     }
   } catch (_) {}
 }
 
+// Per-instrument silence detection (see gap-watch.js): a symbol quiet for much longer than its own usual rhythm is re-priced from the REST snapshot.
+const gapWatch = createGapWatch();
 const tokenToSymbol = new Map(); // token → symbol
 const tokenAliases = new Map();  // token → all saved symbols/aliases using that token
 const symbolToToken = new Map(); // symbol → { token, exchange }
@@ -304,7 +307,7 @@ async function primeSnapshots(pairs = []) {
               avgPrice: Number(row.avgPrice || row.averagePrice || 0),
               ts: normalizedTs,
             };
-            symbols.forEach(symbol => { if (storeQuote(prices, symbol, normalized)) count += 1; });
+            symbols.forEach(symbol => { gapWatch.checked(symbol); if (storeQuote(prices, symbol, normalized)) { count += 1; gapWatch.observe(symbol, normalized.ts); } });
           }
         }
       }
@@ -477,10 +480,11 @@ setInterval(async () => {
 setInterval(() => {
   if (!aoToken) return;
   const open = isNseMarketOpen();
-  const symbols = staleSymbols(prices, { marketOpen: open, limit: open ? 100 : 40 });
+  // Stale by the old rule (no verified time, outside hours, older than 5 minutes) OR gapped by the instrument's own rhythm.
+  const symbols = [...new Set([...staleSymbols(prices, { marketOpen: open, limit: open ? 100 : 40 }), ...gapWatch.gapped(Date.now(), open, openedAtIst()).slice(0, 80)])];
   const pairs = symbols.map(symbol => { const info = symbolToToken.get(symbol); return info ? { symbol, token: info.token, exchange: info.exchange } : null; }).filter(Boolean);
   if (pairs.length) primeSnapshots(pairs).catch(() => {});
-}, 60000);
+}, 30000);
 
 // Self-ping every 14 minutes to prevent Render free tier spin-down
 const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
@@ -503,6 +507,7 @@ app.get("/health", (req, res) => {
     subscriptionPersistence: {status:subscriptionPersistenceStatus,pending:subscriptionPersistence.pending()},
     trackedTokens: tokenToSymbol.size,
     priceCount: Object.keys(prices).length,
+    gaps: gapWatch.stats(Date.now(), marketOpen, openedAtIst()),
     marketOpen,
     lastTickAt: lastTickAt ? new Date(lastTickAt).toISOString() : null,
     lastTickAgeMs,
