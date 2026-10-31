@@ -170,3 +170,6 @@ test("chain legs carry the fair price as ltp and keep the raw last price", async
   const quiet = quoteView({ ltp: 100.5, close: 99, bids: [{ price: 100, qty: 1 }], asks: [{ price: 101, qty: 1 }] });
   assert.equal(quiet.ltp, 100.5);
 });
+
+test('undated option packets cannot erase dated quotes or refresh OI',()=>{const book=new Map();storeTick(book,{exchangeType:2,token:'1',ltp:10,oi:100,ts:NOW});storeTick(book,{exchangeType:2,token:'1',ltp:11,ts:NOW+1000});assert.equal(book.get('2:1').oiTs,NOW);assert.equal(storeTick(book,{exchangeType:2,token:'1',ltp:9,ts:0}),false);assert.equal(book.get('2:1').ltp,11);});
+test('a fresh spot does not make stale option Greeks or OI current',()=>{const {meta,book}=fixture();book.get('1:99926000').ts=NOW+120000;const chain=buildChain({meta,expiry:'2026-11-03',book,now:NOW+120000,width:3,marketOpen:true});assert.equal(chain.spotFresh,true);assert.equal(chain.priceComplete,false);assert.equal(chain.oiComplete,false);assert.equal(chain.pcr,null);assert.equal(chain.maxPain,null);assert.ok(chain.rows.every(row=>row.ce.iv===null&&row.pe.delta===null));});

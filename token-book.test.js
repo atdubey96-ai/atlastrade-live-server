@@ -35,3 +35,13 @@ test("exchange types map to the exchanges the server subscribes", () => {
   assert.equal(EXCHANGE_BY_TYPE[1], "NSE");
   assert.equal(EXCHANGE_BY_TYPE[3], "BSE");
 });
+
+test('subscription payload preserves both exchanges when token numbers collide',async()=>{
+ const {rememberPair,subscriptionGroups}=await import('./token-book.js');const b=book([]);
+ rememberPair(b.aliases,b.tokenToSymbol,b.symbolToToken,{symbol:'NSE500',token:'500',exchange:'NSE'});
+ rememberPair(b.aliases,b.tokenToSymbol,b.symbolToToken,{symbol:'BSE500',token:'500',exchange:'BSE'});
+ assert.equal(b.tokenToSymbol.size,2);assert.deepEqual(subscriptionGroups(b.symbolToToken),[{exchangeType:1,tokens:['500']},{exchangeType:3,tokens:['500']}]);
+ assert.deepEqual([...symbolsForTick(b.aliases,b.tokenToSymbol,b.symbolToToken,'500','NSE')],['NSE500']);
+ assert.equal(symbolsForTick(b.aliases,b.tokenToSymbol,b.symbolToToken,'500',undefined).size,0);
+});
+test('changing a symbol token removes its old packet route',async()=>{const {rememberPair}=await import('./token-book.js'),b=book([]);rememberPair(b.aliases,b.tokenToSymbol,b.symbolToToken,{symbol:'MOVED',token:'1',exchange:'NSE'});rememberPair(b.aliases,b.tokenToSymbol,b.symbolToToken,{symbol:'MOVED',token:'2',exchange:'BSE'});assert.equal(symbolsForTick(b.aliases,b.tokenToSymbol,b.symbolToToken,'1','NSE').size,0);assert.deepEqual([...symbolsForTick(b.aliases,b.tokenToSymbol,b.symbolToToken,'2','BSE')],['MOVED']);});

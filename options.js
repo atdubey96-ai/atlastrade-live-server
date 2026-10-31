@@ -80,7 +80,8 @@ export function parseRestQuote(row, exchangeType) {
 export function storeTick(book, tick) {
   const key = bookKey(tick.exchangeType, tick.token);
   const held = book.get(key);
-  if (held && held.ts > 0 && tick.ts > 0 && tick.ts < held.ts) return false;
+  if (held && held.ts > 0 && (!(tick.ts > 0) || tick.ts < held.ts)) return false;
+  tick = { ...tick, ...(tick.oi !== undefined ? { oiTs: tick.ts } : {}), ...(tick.bids !== undefined || tick.asks !== undefined ? { depthTs: tick.ts } : {}) };
   // Depth and OI arrive only on richer packets; keep what a thinner packet does not carry.
   book.set(key, held ? { ...held, ...Object.fromEntries(Object.entries(tick).filter(([, v]) => v !== undefined)) } : tick);
   return true;
@@ -91,20 +92,22 @@ const round = (v, d = 2) => (Number.isFinite(v) ? +v.toFixed(d) : null);
 // The price a contract is worth right now. The last traded price can be hours older than the live quote (deep in-the-money
 // strikes trade rarely), which puts it outside the bid and ask. When the book is tight and the last price sits outside it, the
 // mid of the book is the fair value; otherwise the last traded price stands. Implied volatility and Greeks are read from this.
-export function effectivePrice(tick) {
+export function effectivePrice(tick, now) {
   const ltp = tick?.ltp > 0 ? tick.ltp : 0;
   const top = list => (Array.isArray(list) && list[0] && list[0].price > 0 ? list[0].price : 0);
-  const bid = top(tick?.bids), ask = top(tick?.asks);
+  const depthAt = tick?.depthTs || tick?.ts || 0;
+  const depthUsable = now === undefined || (depthAt > 0 && depthAt <= now + 60000 && now - depthAt <= 30000);
+  const bid = depthUsable ? top(tick?.bids) : 0, ask = depthUsable ? top(tick?.asks) : 0;
   if (bid > 0 && ask >= bid && ask / bid <= 1.3) {
     if (!ltp || ltp < bid * 0.995 || ltp > ask * 1.005) return round((bid + ask) / 2);
   }
   return ltp;
 }
 
-function legView(ref, tick, extra) {
+function legView(ref, tick, extra, now, marketOpen) {
   if (!ref) return null;
   const ltp = tick?.ltp > 0 ? tick.ltp : 0;
-  const px = effectivePrice(tick);
+  const px = effectivePrice(tick, marketOpen ? now : undefined);
   const close = tick?.close > 0 ? tick.close : 0;
   const pct = Number.isFinite(tick?.oiChangePct) ? tick.oiChangePct : null;
   const oi = tick?.oi > 0 ? tick.oi : 0;
@@ -119,13 +122,15 @@ function legView(ref, tick, extra) {
     oi, oiChg: pct !== null && oi ? Math.round(oi - oi / (1 + pct / 100)) : null,
     volume: tick?.volume || 0,
     bid: bid ? round(bid.price) : null, bidQty: bid?.qty ?? null, ask: ask ? round(ask.price) : null, askQty: ask?.qty ?? null,
-    ts: tick?.ts || 0,
+    ts: tick?.ts || 0, oiTs: tick?.oiTs || (tick?.oi !== undefined ? tick.ts : 0) || 0, depthTs: tick?.depthTs || 0,
+    fresh: fresh(tick?.ts,now,marketOpen),
     ...extra,
   };
 }
 
 // meta: one underlying's entry from /api/instruments?source=options. book: Map of bookKey -> latest tick.
-export function buildChain({ meta, expiry, book, now = Date.now(), width = 20 }) {
+function fresh(ts,now,marketOpen) {return ts > 0 && ts <= now + 60000 && now - ts <= (marketOpen ? 30000 : 8*86400000);}
+export function buildChain({ meta, expiry, book, now = Date.now(), width = 20, marketOpen = true }) {
   const exp = meta.expiries.find(e => e.date === expiry);
   if (!exp) return null;
   const strikes = exp.strikes;
@@ -143,8 +148,10 @@ export function buildChain({ meta, expiry, book, now = Date.now(), width = 20 })
   const slice = strikes.slice(from, to);
 
   const T = M.yearsToExpiry(expiry, now);
-  const preRows = slice.map(s => ({ strike: s.k, ce: { ltp: effectivePrice(tickOf(s.ce)) }, pe: { ltp: effectivePrice(tickOf(s.pe)) } }));
-  const forward = M.impliedForward(preRows, T) || (spot ? spot * Math.exp(M.RATE * T) : null);
+  const modelPrice = tick => fresh(tick?.ts,now,marketOpen) ? effectivePrice(tick,marketOpen ? now : undefined) : 0;
+  const preRows = slice.map(s => ({ strike: s.k, ce: { ltp: modelPrice(tickOf(s.ce)) }, pe: { ltp: modelPrice(tickOf(s.pe)) } }));
+  const spotFresh = fresh(spotTick?.ts,now,marketOpen);
+  const forward = spotFresh && T > 0 ? M.impliedForward(preRows, T) || (spot ? spot * Math.exp(M.RATE * T) : null) : null;
 
   const rows = slice.map(s => {
     const ceTick = tickOf(s.ce), peTick = tickOf(s.pe);
@@ -153,11 +160,11 @@ export function buildChain({ meta, expiry, book, now = Date.now(), width = 20 })
       // Implied volatility is read from the out-of-the-money option of each strike, then used for both sides.
       const otmIsCall = s.k >= forward;
       const otm = otmIsCall ? ceTick : peTick;
-      const otmPx = effectivePrice(otm);
+      const otmPx = modelPrice(otm);
       iv = otmPx > 0 ? M.impliedVol(otmIsCall ? "CE" : "PE", otmPx, forward, s.k, T) : null;
       if (iv === null) {
         const itm = otmIsCall ? peTick : ceTick;
-        const itmPx = effectivePrice(itm);
+        const itmPx = modelPrice(itm);
         iv = itmPx > 0 ? M.impliedVol(otmIsCall ? "PE" : "CE", itmPx, forward, s.k, T) : null;
       }
     }
@@ -166,24 +173,28 @@ export function buildChain({ meta, expiry, book, now = Date.now(), width = 20 })
     const greekPart = (gr, v) => ({ iv: v ? round(v * 100, 2) : null, delta: gr ? round(gr.delta, 3) : null, gamma: gr ? +gr.gamma.toFixed(5) : null, theta: gr ? round(gr.theta, 2) : null, vega: gr ? round(gr.vega, 2) : null });
     return {
       strike: s.k,
-      ce: legView(s.ce, ceTick, greekPart(gc, iv)),
-      pe: legView(s.pe, peTick, greekPart(gp, iv)),
+      ce: legView(s.ce, ceTick, greekPart(gc, iv), now, marketOpen),
+      pe: legView(s.pe, peTick, greekPart(gp, iv), now, marketOpen),
     };
   });
 
   let atm = rows.length ? rows[Math.min(rows.length - 1, Math.max(0, centre - from))] : null;
   const straddle = (atm?.ce?.px || atm?.ce?.ltp) && (atm?.pe?.px || atm?.pe?.ltp) ? round((atm.ce.px || atm.ce.ltp) + (atm.pe.px || atm.pe.ltp)) : null;
+  const legs = rows.flatMap(row => [row.ce,row.pe]).filter(Boolean);
+  const oiComplete = legs.length > 0 && legs.every(leg => fresh(leg.oiTs,now,marketOpen));
+  const priceComplete = spotFresh && legs.length > 0 && legs.every(leg => leg.fresh);
   const newest = rows.reduce((t, r) => Math.max(t, r.ce?.ts || 0, r.pe?.ts || 0), spotTick?.ts || 0);
 
   return {
     underlying: meta.name, label: meta.label, expiry, lotSize: meta.lotSize, tickSize: meta.tick,
     daysToExpiry: M.daysToExpiry(expiry, now),
+    spotTs: spotTick?.ts || 0, spotFresh, priceComplete, oiComplete,
     spot: round(spot), spotPrev: spotTick?.close > 0 ? round(spotTick.close) : null,
     spotChgPct: spot && spotTick?.close > 0 ? round((spot / spotTick.close - 1) * 100) : null,
     forward: round(forward), atmStrike: atm?.strike ?? null, atmIv: atm?.ce?.iv ?? null,
     straddle, expectedMovePct: straddle && spot ? round(straddle / spot * 100) : null,
-    pcr: round(M.putCallRatio(rows), 2), maxPain: M.maxPain(rows),
-    totalCeOi: rows.reduce((t, r) => t + (r.ce?.oi || 0), 0), totalPeOi: rows.reduce((t, r) => t + (r.pe?.oi || 0), 0),
+    pcr: oiComplete ? round(M.putCallRatio(rows), 2) : null, maxPain: oiComplete ? M.maxPain(rows) : null,
+    totalCeOi: oiComplete ? rows.reduce((t, r) => t + (r.ce?.oi || 0), 0) : null, totalPeOi: oiComplete ? rows.reduce((t, r) => t + (r.pe?.oi || 0), 0) : null,
     asOf: newest || null, ageMs: newest ? Math.max(0, now - newest) : null,
     rows,
   };

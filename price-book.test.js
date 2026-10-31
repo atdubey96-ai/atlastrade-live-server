@@ -89,3 +89,6 @@ test("stale symbols are those unverified, out of hours, or silent while the mark
   assert.deepEqual(staleSymbols(book, { marketOpen: false, now }).sort(), ["NOTS", "REPLAY"]);
   assert.equal(staleSymbols(book, { marketOpen: true, now, limit: 1 }).length, 1);
 });
+
+test('a stopped entire feed cannot look live merely because all its prices are equally old',()=>{const book={SBIN:{ltp:100,ts:NOW}};assert.deepEqual(servableQuotes(book,null,{now:NOW+120000,marketOpen:true}),{});assert.ok(servableQuotes(book,null,{now:NOW+120000,marketOpen:false}).SBIN);});
+test('the verified special Sunday session is accepted while other Sunday packets are not',()=>{assert.equal(inTradingWindow(Date.parse('2026-11-08T14:25:00+05:30')),true);assert.equal(inTradingWindow(Date.parse('2026-11-08T10:00:00+05:30')),false);assert.equal(inTradingWindow(Date.parse('2026-11-10T11:00:00+05:30')),false);});

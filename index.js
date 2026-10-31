@@ -1,8 +1,11 @@
+import { createRequire } from "node:module";
+const marketCalendar = createRequire(import.meta.url)("./market-engine.cjs");
 // AtlasTrade Live Price Server
 // Maintains Angel One WebSocket 24/7, serves live prices via REST API
 // Deploy on Render.com free tier
 
-import { symbolsForTick, EXCHANGE_BY_TYPE } from "./token-book.js";
+import { symbolsForTick, EXCHANGE_BY_TYPE, rememberPair, subscriptionGroups, cashKey, validPair } from "./token-book.js";
+import { persistence } from "./subscription-persistence.js";
 import express from "express";
 import cors from "cors";
 import fetch from "node-fetch";
@@ -175,7 +178,7 @@ function parseBinaryTick(buf) {
     if (subscriptionMode !== 1 && subscriptionMode !== 2 && subscriptionMode !== 3) return;
     const exchType = buf.readUInt8(1);
     // Futures and options tokens can equal cash-market tokens; they belong to the option book only.
-    if (exchType === 2 || exchType === 4) return;
+    if (!EXCHANGE_BY_TYPE[exchType]) return;
     const token = buf.slice(2, 27).toString("utf8").replace(/\0/g, "").trim();
     if (buf.length < 51) return;
     const seqNum = buf.readBigInt64LE(27);
@@ -212,17 +215,19 @@ function parseBinaryTick(buf) {
 const tokenToSymbol = new Map(); // token → symbol
 const tokenAliases = new Map();  // token → all saved symbols/aliases using that token
 const symbolToToken = new Map(); // symbol → { token, exchange }
+let subscriptionPersistenceStatus = 'starting';
+const subscriptionPersistence = persistence({ fetch,site: process.env.ZENITH_SITE_URL || 'https://atlastrade-portfolio.vercel.app',token:process.env.LIVE_SERVICE_TOKEN || '',
+ onRestore: pairs => {subscribe(pairs, false); primeSnapshots(pairs).catch(()=>{});},
+ onStatus: status => {subscriptionPersistenceStatus=status;}
+});
 
-function subscribe(symbolTokenPairs) {
+
+function subscribe(symbolTokenPairs, persist = true) {
   // symbolTokenPairs: [{ symbol, token, exchange }]
-  symbolTokenPairs.forEach(({ symbol, token, exchange }) => {
-    const tokenKey = String(token);
-    tokenToSymbol.set(tokenKey, symbol);
-    if (!tokenAliases.has(tokenKey)) tokenAliases.set(tokenKey, new Set());
-    tokenAliases.get(tokenKey).add(symbol);
-    symbolToToken.set(symbol, { token: tokenKey, exchange: exchange || "NSE" });
-    subscribedTokens.add(tokenKey);
+  symbolTokenPairs.forEach(pair => {
+    if (rememberPair(tokenAliases, tokenToSymbol, symbolToToken, pair)) subscribedTokens.add(cashKey(pair.exchange, pair.token));
   });
+  if (persist) subscriptionPersistence.queue(symbolTokenPairs);
   if (wsConn?.readyState === WebSocket.OPEN) {
     resubscribeAll();
   }
@@ -315,20 +320,10 @@ async function primeSnapshots(pairs = []) {
 
 function resubscribeAll() {
   if (!wsConn || wsConn.readyState !== WebSocket.OPEN) return;
-  const nseTokens = [];
-  const bseTokens = [];
-  tokenToSymbol.forEach((sym, token) => {
-    const info = symbolToToken.get(sym);
-    if (info?.exchange === "BSE") bseTokens.push(token);
-    else nseTokens.push(token);
-  });
-
-  const payload = { correlationID: "atlas", action: 1, params: { mode: 3, tokenList: [] } };
-  if (nseTokens.length) payload.params.tokenList.push({ exchangeType: 1, tokens: nseTokens });
-  if (bseTokens.length) payload.params.tokenList.push({ exchangeType: 3, tokens: bseTokens });
-  if (payload.params.tokenList.length) {
-    wsConn.send(JSON.stringify(payload));
-    console.log(`Subscribed ${nseTokens.length} NSE + ${bseTokens.length} BSE tokens`);
+  const tokenList = subscriptionGroups(symbolToToken);
+  if (tokenList.length) {
+    wsConn.send(JSON.stringify({correlationID:"atlas",action:1,params:{mode:3,tokenList}}));
+    console.log(`Subscribed ${tokenList.reduce((sum,group)=>sum+group.tokens.length,0)} cash instruments across ${tokenList.length} exchanges`);
   }
 }
 
@@ -458,14 +453,9 @@ async function ensureLoggedIn(force = false) {
 ensureLoggedIn();
 setInterval(ensureLoggedIn, 30 * 60 * 1000); // check every 30 min
 
-function isNseMarketOpen(now = new Date()) {
-  const parts = new Intl.DateTimeFormat("en-GB", {
-    timeZone: "Asia/Kolkata", weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false,
-  }).formatToParts(now).reduce((out, part) => (out[part.type] = part.value, out), {});
-  if (parts.weekday === "Sat" || parts.weekday === "Sun") return false;
-  const minutes = Number(parts.hour) * 60 + Number(parts.minute);
-  return minutes >= 9 * 60 + 15 && minutes <= 15 * 60 + 30;
-}
+function isNseMarketOpen(now = new Date()) {return marketCalendar.isMarketOpen("NSE",now);}
+function isOptionsMarketOpen(now = new Date()) {return marketCalendar.isMarketOpen("NFO",now);}
+
 
 // A connected socket that has stopped producing ticks is not healthy. Recover
 // proactively during market hours instead of waiting for a close event.
@@ -509,6 +499,7 @@ app.get("/health", (req, res) => {
     feedHealthy: wsConn?.readyState === WebSocket.OPEN && (!marketOpen || (lastTickAgeMs !== null && lastTickAgeMs <= 120000)),
     loggedIn: !!aoToken,
     trackedSymbols: symbolToToken.size,
+    subscriptionPersistence: {status:subscriptionPersistenceStatus,pending:subscriptionPersistence.pending()},
     trackedTokens: tokenToSymbol.size,
     priceCount: Object.keys(prices).length,
     marketOpen,
@@ -531,13 +522,16 @@ app.get("/prices", (req, res) => {
     return res.json(all);
   }
   // Withheld quotes make the website fall back to its verified backup source.
-  res.json(servableQuotes(prices, syms.length ? syms : null));
+  res.json(servableQuotes(prices, syms.length ? syms : null, {now:Date.now(),marketOpen:isNseMarketOpen()}));
 });
 
 // Subscribe symbols to live feed
 app.post("/subscribe", async (req, res) => {
   const { symbols } = req.body; // [{ symbol, token, exchange }]
   if (!Array.isArray(symbols) || !symbols.length) return res.status(400).json({ error: "symbols array required" });
+  if (symbols.length > 700 || symbols.some(pair => !validPair(pair))) return res.status(400).json({error:"Invalid or oversized cash subscription"});
+  const additions = symbols.filter(pair => !symbolToToken.has(pair.symbol)).length;
+  if (symbolToToken.size + additions > 700) return res.status(429).json({error:"Cash subscription capacity reached"});
   await ensureLoggedIn();
   subscribe(symbols);
   primeSnapshots(symbols).catch(() => {});
@@ -588,11 +582,11 @@ app.get("/options/chain", async (req, res) => {
     const spot = optionBook.get(bookKey(spotItem.exchangeType, spotItem.token))?.ltp || null;
     const wanted = windowTokens({ meta: u, expiry, spot, width });
     trackOptionTokens(wanted);
-    const missing = wanted.filter(item => !optionBook.has(bookKey(item.exchangeType, item.token)));
-    if (missing.length > wanted.length * 0.3) await primeOptionTokens(missing);
-    const chain = buildChain({ meta: u, expiry, book: optionBook, width });
+    const missing = wanted.filter(item => {const tick=optionBook.get(bookKey(item.exchangeType,item.token));return !tick?.ts || (isOptionsMarketOpen() && Date.now()-tick.ts>30000);});
+    if (missing.length) await primeOptionTokens(missing);
+    const chain = buildChain({ meta: u, expiry, book: optionBook, width, marketOpen: isOptionsMarketOpen() });
     if (!chain) return res.status(404).json({ error: `no ${underlying} expiry ${expiry}` });
-    chain.feed = { connected: wsConn?.readyState === WebSocket.OPEN, marketOpen: isNseMarketOpen(), streamedTokens: optionSubs.size };
+    chain.feed = { connected: wsConn?.readyState === WebSocket.OPEN, marketOpen: isOptionsMarketOpen(), streamedTokens: optionSubs.size };
     res.json(chain);
   } catch (error) { res.status(502).json({ error: error.message }); }
 });
@@ -613,7 +607,7 @@ app.get("/options/quotes", async (req, res) => {
       if (contract) { found.set(key, contract); wanted.push(contract); }
     }
     trackOptionTokens(wanted);
-    const missing = wanted.filter(item => !optionBook.has(bookKey(item.exchangeType, item.token)));
+    const missing = wanted.filter(item => {const tick=optionBook.get(bookKey(item.exchangeType,item.token));return !tick?.ts || (isOptionsMarketOpen() && Date.now()-tick.ts>30000);});
     if (missing.length) await primeOptionTokens(missing);
     const quotes = {};
     for (const [key, contract] of found) {
@@ -730,7 +724,7 @@ async function holdingsSummaryLines() {
       if (res.ok) Object.assign(official, await res.json());
     } catch (_) {}
   }
-  const live = servableQuotes(prices, symbols);
+  const live = servableQuotes(prices, symbols, {now:Date.now(),marketOpen:isNseMarketOpen()});
   const quoteOf = symbol => {
     const q = live[symbol], o = official[symbol];
     if (q && q.ltp > 0) return { ltp: q.ltp, prev: o && o.prevClose > 0 ? o.prevClose : q.close };
@@ -792,3 +786,10 @@ setInterval(async () => {
 }, 30000);
 
 app.listen(PORT, () => console.log(`AtlasTrade server running on port ${PORT}`));
+
+subscriptionPersistence.restore().catch(()=>{});
+const persistenceRecovery = setInterval(()=>{if(subscriptionPersistenceStatus==='restore-failed')subscriptionPersistence.restore().catch(()=>{});},60000);
+persistenceRecovery.unref?.();
+
+async function refreshTradingCalendar(){try{const r=await fetch(`${SITE_URL}/api/indices?route=calendar`,{signal:AbortSignal.timeout(15000)});if(r.ok)marketCalendar.applyCalendar(await r.json());}catch{}}
+refreshTradingCalendar();const calendarTimer=setInterval(refreshTradingCalendar,6*3600000);calendarTimer.unref?.();

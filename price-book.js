@@ -1,10 +1,12 @@
+import { createRequire } from "node:module";
+const calendar=createRequire(import.meta.url)("./market-engine.cjs");
 // Price book rules for the live server.
 //
 // A quote is only as fresh as the exchange timestamp it carries. Packets that arrive
 // without a valid exchange time (pre-open or replayed packets) must never be stamped
 // with the server clock, because that makes old data look live.
 
-const MAX_FUTURE_MS = 10 * 60 * 1000;
+const MAX_FUTURE_MS = 60000;
 const MAX_PAST_MS = 30 * 24 * 60 * 60 * 1000;
 const STALE_GAP_MS = 6 * 60 * 60 * 1000;
 
@@ -38,7 +40,9 @@ export function inTradingWindow(ms) {
   if (!(ms > 0)) return false;
   const ist = new Date(ms + IST_OFFSET_MS);
   const day = ist.getUTCDay();
-  if (day === 0 || day === 6) return false;
+  const date=ist.toISOString().slice(0,10);
+  if(date==='2026-11-08'){const minutes=ist.getUTCHours()*60+ist.getUTCMinutes();return minutes>=14*60+5&&minutes<=16*60;}
+  if (day === 0 || day === 6 || calendar.holidays.NSE.has(date)) return false;
   const minutes = ist.getUTCHours() * 60 + ist.getUTCMinutes();
   return minutes >= 9 * 60 && minutes <= 16 * 60 + 30;
 }
@@ -57,7 +61,7 @@ export function storeQuote(book, symbol, quote) {
 
 // Quotes that are safe to serve: a verified exchange time, and not left behind by
 // more than STALE_GAP_MS compared with the newest verified quote in the book.
-export function servableQuotes(book, symbols) {
+export function servableQuotes(book, symbols, options = {}) {
   const keys = symbols && symbols.length ? symbols : Object.keys(book);
   let newest = 0;
   for (const key of Object.keys(book)) { const t = Number(book[key]?.ts) || 0; if (inTradingWindow(t)) newest = Math.max(newest, t); }
@@ -66,6 +70,7 @@ export function servableQuotes(book, symbols) {
     const quote = book[key];
     const ts = Number(quote?.ts) || 0;
     if (!quote || ts <= 0) continue;
+    if (options.now && (ts > options.now + 60000 || options.now - ts > (options.marketOpen ? 90000 : 8*86400000))) continue;
     if (!inTradingWindow(ts)) continue;
     if (newest - ts > STALE_GAP_MS) continue;
     result[key] = quote;
