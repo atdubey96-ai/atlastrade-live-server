@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {serviceAuthorized,requireService} from './service-auth.js';
-import {directoryIndex,matchesDirectory} from './cash-directory.js';
+import {directoryIndex,matchesDirectory,partitionDirectory,repairPair} from './cash-directory.js';
 import {createGapWatch} from './gap-watch.js';
 import identity from './instrument-identity.cjs';
 test('subscription and operational mutations require a server-only service token',()=>{
@@ -41,4 +41,12 @@ test('directory validation preserves numeric BSE listings, ETF display spaces an
  assert.equal(matchesDirectory(index,{symbol:'GOLD BEES',token:'14428',exchange:'NSE'}),true);
  assert.equal(matchesDirectory(index,{symbol:'CENTURYTEX',token:'625',exchange:'NSE'}),true);
  assert.equal(matchesDirectory(index,{symbol:'TCS',token:'625',exchange:'NSE'}),false);
+});
+
+test('a bad mapping does not block good mappings, and persisted stale tokens are repaired only when unambiguous',()=>{
+ const index=directoryIndex([{name:'INFY',symbol:'INFY-EQ',token:'1594',exch_seg:'NSE'},{name:'TCS',symbol:'TCS-EQ',token:'11536',exch_seg:'NSE'}]);
+ const a={symbol:'INFY',token:'1594',exchange:'NSE'},b={symbol:'TCS',token:'1594',exchange:'NSE'};
+ const result=partitionDirectory(index,[a,b]);assert.equal(result.accepted.length,1);assert.equal(result.rejected.length,1);
+ assert.equal(repairPair(index,b).token,'11536');
+ index.set('NSE:999',new Set(['TCS']));assert.equal(repairPair(index,b),null);
 });

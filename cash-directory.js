@@ -7,7 +7,7 @@ export function directoryIndex(rows){
  const index=new Map();
  for(const row of rows){
   const ex=String(row.exch_seg||row.exchange||'').toUpperCase(),type=String(row.instrumenttype||'').toUpperCase();
-  if(!['NSE','BSE'].includes(ex)||!['','EQ','EQUITY','AMXIDX'].includes(type))continue;
+  if(!['NSE','BSE'].includes(ex)||!['','EQ','EQUITY','AMXIDX','INDEX','ETF','SGB','BOND','DEB'].includes(type))continue;
   const token=String(row.token||row.symboltoken||'');if(!/^\d+$/.test(token))continue;
   const key=ex+':'+token,set=index.get(key)||new Set();
   for(const name of [row.name,row.symbol,row.tradingsymbol])if(name)set.add(aliases(name));
@@ -18,6 +18,16 @@ export function directoryIndex(rows){
  return index;
 }
 export function matchesDirectory(index,pair){return !!index.get((pair.exchange||'NSE')+':'+String(pair.token))?.has(aliases(pair.symbol));}
+export function partitionDirectory(index,pairs){
+ return {accepted:pairs.filter(p=>matchesDirectory(index,p)),rejected:pairs.filter(p=>!matchesDirectory(index,p))};
+}
+export function repairPair(index,pair){
+ if(matchesDirectory(index,pair))return pair;
+ const name=aliases(pair.symbol),prefix=(pair.exchange||'NSE')+':';
+ const candidates=[...index].filter(([key,names])=>key.startsWith(prefix)&&names.has(name));
+ if(candidates.length!==1)return null;
+ return {...pair,token:candidates[0][0].slice(prefix.length),exchange:pair.exchange||'NSE'};
+}
 export function createDirectory(fetcher){
  let cached=null,pending=null;
  return async function load(){

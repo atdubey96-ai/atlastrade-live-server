@@ -1,6 +1,6 @@
 import identity from "./instrument-identity.cjs";
 import {requireService} from './service-auth.js';
-import {createDirectory,matchesDirectory} from './cash-directory.js';
+import {createDirectory,matchesDirectory,partitionDirectory,repairPair} from './cash-directory.js';
 import { createRequire } from "node:module";
 const marketCalendar = createRequire(import.meta.url)("./market-engine.cjs");
 // AtlasTrade Live Price Server
@@ -224,11 +224,17 @@ const tokenToSymbol = new Map(); // token → symbol
 const tokenAliases = new Map();  // token → all saved symbols/aliases using that token
 const symbolToToken = new Map(); // symbol → { token, exchange }
 let subscriptionPersistenceStatus = 'starting';
+const subscriptionRestoreRejected=new Set();
 const subscriptionPersistence = persistence({ fetch,site: process.env.ZENITH_SITE_URL || 'https://atlastrade-portfolio.vercel.app',token:process.env.LIVE_SERVICE_TOKEN || '',
  onRestore: async pairs => {
   const directory=await cashDirectory();
-  const verified=pairs.filter(pair=>matchesDirectory(directory,pair));
+  const verified=pairs.map(pair=>repairPair(directory,pair)).filter(Boolean);
+  subscriptionRestoreRejected.clear();
+  const restored=new Set(verified.map(p=>p.symbol));
+  pairs.filter(p=>!restored.has(p.symbol)).forEach(p=>subscriptionRestoreRejected.add(p.symbol));
   subscribe(verified, false); primeSnapshots(verified).catch(()=>{});
+  const corrected=verified.filter(pair=>pairs.some(old=>old.symbol===pair.symbol&&String(old.token)!==String(pair.token)));
+  if(corrected.length)subscriptionPersistence.queue(corrected);
  },
  onStatus: status => {subscriptionPersistenceStatus=status;}
 });
@@ -238,7 +244,7 @@ function subscribe(symbolTokenPairs, persist = true) {
   // symbolTokenPairs: [{ symbol, token, exchange }]
   symbolTokenPairs.forEach(pair => {
     if (rememberPair(tokenAliases, tokenToSymbol, symbolToToken, pair)) {
-      subscribedTokens.add(cashKey(pair.exchange, pair.token));gapWatch.register(pair.symbol);
+      subscribedTokens.add(cashKey(pair.exchange, pair.token));gapWatch.register(pair.symbol);subscriptionRestoreRejected.delete(pair.symbol);
     }
   });
   if (persist) subscriptionPersistence.queue(symbolTokenPairs);
@@ -514,7 +520,7 @@ app.get("/health", (req, res) => {
     feedHealthy: wsConn?.readyState === WebSocket.OPEN && (!marketOpen || (lastTickAgeMs !== null && lastTickAgeMs <= 120000)),
     loggedIn: !!aoToken,
     trackedSymbols: symbolToToken.size,
-    subscriptionPersistence: {status:subscriptionPersistenceStatus,pending:subscriptionPersistence.pending()},
+    subscriptionPersistence: {status:subscriptionPersistenceStatus,pending:subscriptionPersistence.pending(),rejectedMappings:subscriptionRestoreRejected.size},
     trackedTokens: tokenToSymbol.size,
     priceCount: Object.keys(prices).length,
     gaps: gapWatch.stats(Date.now(), marketOpen, openedAtIst()),
@@ -546,17 +552,18 @@ app.post("/subscribe", requireService, async (req, res) => {
   const { symbols } = req.body; // [{ symbol, token, exchange }]
   if (!Array.isArray(symbols) || !symbols.length) return res.status(400).json({ error: "symbols array required" });
   if (symbols.length > 700 || symbols.some(pair => !validPair(pair))) return res.status(400).json({error:"Invalid or oversized cash subscription"});
-  const additions = symbols.filter(pair => !symbolToToken.has(pair.symbol)).length;
-  if (symbolToToken.size + additions > 700) return res.status(429).json({error:"Cash subscription capacity reached"});
   let directory;
   try { directory=await cashDirectory(); }
   catch { return res.status(503).json({error:"Instrument directory unavailable; subscriptions unchanged"}); }
-  if(symbols.some(pair=>!matchesDirectory(directory,pair)))return res.status(400).json({error:"Symbol, exchange and token do not match the broker directory"});
+  const {accepted,rejected}=partitionDirectory(directory,symbols);
+  if(!accepted.length)return res.status(400).json({error:"No verified symbol, exchange and token mappings"});
+  const additions=accepted.filter(pair=>!symbolToToken.has(pair.symbol)).length;
+  if(symbolToToken.size+additions>700)return res.status(429).json({error:"Cash subscription capacity reached"});
   try {
     await ensureLoggedIn();
-    subscribe(symbols);
-    primeSnapshots(symbols).catch(() => {});
-    res.json({ ok: true, subscribed: symbols.length, total: symbolToToken.size, tokens: tokenToSymbol.size, connected: wsConn?.readyState === WebSocket.OPEN });
+    subscribe(accepted);
+    primeSnapshots(accepted).catch(() => {});
+    res.json({ ok: true, rejected:rejected.map(p=>p.symbol), subscribed: accepted.length, total: symbolToToken.size, tokens: tokenToSymbol.size, connected: wsConn?.readyState === WebSocket.OPEN });
   } catch { return res.status(503).json({error:'Broker connection temporarily unavailable'}); }
 });
 
