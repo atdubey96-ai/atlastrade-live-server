@@ -1,3 +1,6 @@
+import identity from "./instrument-identity.cjs";
+import {requireService} from './service-auth.js';
+import {createDirectory,matchesDirectory} from './cash-directory.js';
 import { createRequire } from "node:module";
 const marketCalendar = createRequire(import.meta.url)("./market-engine.cjs");
 // AtlasTrade Live Price Server
@@ -16,6 +19,7 @@ import { evaluate as evaluateHealth, emptyState as healthState } from "./health-
 import { formatUpdate, dueUpdate, sendTelegram, findChats, summarizeHoldings, holdingsLines, isIndiaTradingDay, INDIA_SESSION_KINDS } from "./telegram.js";
 import { parseSnapPacket, parseRestQuote, storeTick, buildChain, windowTokens, bookKey, EXCHANGE_TYPE, resolveContract, quoteView, candleRequest, parseCandles } from "./options.js";
 
+const cashDirectory = createDirectory(fetch);
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -207,7 +211,7 @@ function parseBinaryTick(buf) {
       // with the server clock, so old pre-open data cannot pass as a live quote.
       const normalizedExchangeTime = exchangeTimeMs(exchangeTime);
       symbols.forEach(sym => {
-        if (storeQuote(prices, sym, { ltp, open, high, low, close, volume, avgPrice, ts: normalizedExchangeTime })) gapWatch.observe(sym, normalizedExchangeTime);
+        if (storeQuote(prices, sym, { instrumentId:identity.quoteId({symbol:sym,exchange:EXCHANGE_BY_TYPE[exchType]}), ltp, open, high, low, close, volume, avgPrice, ts: normalizedExchangeTime })) gapWatch.observe(sym, normalizedExchangeTime);
       });
       if (normalizedExchangeTime) lastTickAt = Math.max(lastTickAt, normalizedExchangeTime);
     }
@@ -221,7 +225,11 @@ const tokenAliases = new Map();  // token → all saved symbols/aliases using th
 const symbolToToken = new Map(); // symbol → { token, exchange }
 let subscriptionPersistenceStatus = 'starting';
 const subscriptionPersistence = persistence({ fetch,site: process.env.ZENITH_SITE_URL || 'https://atlastrade-portfolio.vercel.app',token:process.env.LIVE_SERVICE_TOKEN || '',
- onRestore: pairs => {subscribe(pairs, false); primeSnapshots(pairs).catch(()=>{});},
+ onRestore: async pairs => {
+  const directory=await cashDirectory();
+  const verified=pairs.filter(pair=>matchesDirectory(directory,pair));
+  subscribe(verified, false); primeSnapshots(verified).catch(()=>{});
+ },
  onStatus: status => {subscriptionPersistenceStatus=status;}
 });
 
@@ -229,7 +237,9 @@ const subscriptionPersistence = persistence({ fetch,site: process.env.ZENITH_SIT
 function subscribe(symbolTokenPairs, persist = true) {
   // symbolTokenPairs: [{ symbol, token, exchange }]
   symbolTokenPairs.forEach(pair => {
-    if (rememberPair(tokenAliases, tokenToSymbol, symbolToToken, pair)) subscribedTokens.add(cashKey(pair.exchange, pair.token));
+    if (rememberPair(tokenAliases, tokenToSymbol, symbolToToken, pair)) {
+      subscribedTokens.add(cashKey(pair.exchange, pair.token));gapWatch.register(pair.symbol);
+    }
   });
   if (persist) subscriptionPersistence.queue(symbolTokenPairs);
   if (wsConn?.readyState === WebSocket.OPEN) {
@@ -307,7 +317,7 @@ async function primeSnapshots(pairs = []) {
               avgPrice: Number(row.avgPrice || row.averagePrice || 0),
               ts: normalizedTs,
             };
-            symbols.forEach(symbol => { gapWatch.checked(symbol); if (storeQuote(prices, symbol, normalized)) { count += 1; gapWatch.observe(symbol, normalized.ts); } });
+            symbols.forEach(symbol => { gapWatch.checked(symbol); if (storeQuote(prices, symbol, {...normalized,instrumentId:identity.quoteId({symbol,exchange})})) { count += 1; gapWatch.observe(symbol, normalized.ts); } });
           }
         }
       }
@@ -532,16 +542,22 @@ app.get("/prices", (req, res) => {
 });
 
 // Subscribe symbols to live feed
-app.post("/subscribe", async (req, res) => {
+app.post("/subscribe", requireService, async (req, res) => {
   const { symbols } = req.body; // [{ symbol, token, exchange }]
   if (!Array.isArray(symbols) || !symbols.length) return res.status(400).json({ error: "symbols array required" });
   if (symbols.length > 700 || symbols.some(pair => !validPair(pair))) return res.status(400).json({error:"Invalid or oversized cash subscription"});
   const additions = symbols.filter(pair => !symbolToToken.has(pair.symbol)).length;
   if (symbolToToken.size + additions > 700) return res.status(429).json({error:"Cash subscription capacity reached"});
-  await ensureLoggedIn();
-  subscribe(symbols);
-  primeSnapshots(symbols).catch(() => {});
-  res.json({ ok: true, subscribed: symbols.length, total: symbolToToken.size, tokens: tokenToSymbol.size, connected: wsConn?.readyState === WebSocket.OPEN });
+  let directory;
+  try { directory=await cashDirectory(); }
+  catch { return res.status(503).json({error:"Instrument directory unavailable; subscriptions unchanged"}); }
+  if(symbols.some(pair=>!matchesDirectory(directory,pair)))return res.status(400).json({error:"Symbol, exchange and token do not match the broker directory"});
+  try {
+    await ensureLoggedIn();
+    subscribe(symbols);
+    primeSnapshots(symbols).catch(() => {});
+    res.json({ ok: true, subscribed: symbols.length, total: symbolToToken.size, tokens: tokenToSymbol.size, connected: wsConn?.readyState === WebSocket.OPEN });
+  } catch { return res.status(503).json({error:'Broker connection temporarily unavailable'}); }
 });
 
 // Fetch live NSE quote (fallback when WebSocket not available)
@@ -618,7 +634,7 @@ app.get("/options/quotes", async (req, res) => {
     const quotes = {};
     for (const [key, contract] of found) {
       const view = quoteView(optionBook.get(bookKey(contract.exchangeType, contract.token)));
-      quotes[key] = view ? { ...view, symbol: contract.symbol, lotSize: contract.lotSize } : { symbol: contract.symbol, lotSize: contract.lotSize, ltp: null };
+      quotes[key] = view ? { ...view, instrumentId:identity.quoteId({symbol:contract.symbol,exchange:"NFO"}), symbol: contract.symbol, lotSize: contract.lotSize } : { symbol: contract.symbol, lotSize: contract.lotSize, ltp: null };
     }
     res.json({ quotes, feed: { connected: wsConn?.readyState === WebSocket.OPEN, marketOpen: isNseMarketOpen() } });
   } catch (error) { res.status(502).json({ error: error.message }); }
@@ -759,7 +775,7 @@ async function indiaTradedToday() {
 }
 
 // Pairs the bot with the one chat that has messaged it. Refuses when several chats did, so a stranger cannot take over.
-app.get("/telegram/pair", async (req, res) => {
+app.get("/telegram/pair", requireService, async (req, res) => {
   res.set("Cache-Control", "no-store");
   if (!TELEGRAM_TOKEN) return res.status(400).json({ error: "TELEGRAM_BOT_TOKEN is not set" });
   try {
@@ -773,7 +789,7 @@ app.get("/telegram/pair", async (req, res) => {
 });
 
 // Sends a sample update to the paired chat now (at most one a minute).
-app.get("/telegram/sample", async (req, res) => {
+app.get("/telegram/sample", requireService, async (req, res) => {
   res.set("Cache-Control", "no-store");
   if (Date.now() - telegramLastSampleAt < 60000) return res.status(429).json({ error: "A sample was just sent; wait a minute." });
   telegramLastSampleAt = Date.now();

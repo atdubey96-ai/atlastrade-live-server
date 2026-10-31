@@ -3,7 +3,7 @@
 // A single bad check is often a blip, so a source must be unhealthy on two checks in a row before anyone is told, the same
 // problem is not repeated for six hours, and when the source recovers (two good checks in a row) one "recovered" message follows.
 
-const NAMES = { liveServer: "Indian live prices", usFeed: "US prices", crypto: "Crypto prices", mutualFunds: "Mutual fund NAV", calendar: "Market calendar", database: "Cloud database" };
+const NAMES = { quoteQuality: "Device quote validation", liveServer: "Indian live prices", usFeed: "US prices", crypto: "Crypto prices", mutualFunds: "Mutual fund NAV", calendar: "Market calendar", database: "Cloud database" };
 export const CHECKS_BEFORE_ALERT = 2;
 export const REPEAT_AFTER_MS = 6 * 60 * 60 * 1000;
 

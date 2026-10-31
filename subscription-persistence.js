@@ -4,7 +4,7 @@ export function persistence({fetch,site,token,onRestore,onStatus=()=>{}}){
  const endpoint=`${site}/api/indices?route=subscription-state`;
  async function restore(){
   if(!token){onStatus('unconfigured');return false;}
-  try{const response=await fetch(endpoint,{headers:{Authorization:`Bearer ${token}`},signal:AbortSignal.timeout(15000)});if(!response.ok)throw Error('Persistence unavailable');const data=await response.json();if(!Array.isArray(data.symbols))throw Error('Invalid persistence response');onRestore(data.symbols);onStatus('restored');return true;}catch{onStatus('restore-failed');return false;}
+  try{const response=await fetch(endpoint,{headers:{Authorization:`Bearer ${token}`},signal:AbortSignal.timeout(15000)});if(!response.ok)throw Error('Persistence unavailable');const data=await response.json();if(!Array.isArray(data.symbols))throw Error('Invalid persistence response');await onRestore(data.symbols);onStatus('restored');return true;}catch{onStatus('restore-failed');return false;}
  }
  async function flush(){
   if(saving||!pending.size||!token)return;

@@ -18,11 +18,14 @@ export function createGapWatch({ minThresholdMs = 90000, maxThresholdMs = 600000
   const closed = [];           // times gaps ended (a tick arrived after a gap was open)
   let triggered = 0;
 
+  function register(symbol, now=Date.now()) {
+    if(symbol&&!book.has(symbol))book.set(symbol,{last:0,ewma:0,ticks:0,open:false,checkedAt:0,registeredAt:now});
+  }
   function observe(symbol, ts, now = Date.now()) {
     const t = Number(ts) || 0;
     if (!symbol || t <= 0) return;
     let s = book.get(symbol);
-    if (!s) { s = { last: 0, ewma: 0, ticks: 0, open: false, checkedAt: 0 }; book.set(symbol, s); }
+    if (!s) { register(symbol,t); s=book.get(symbol); }
     if (t <= s.last) return;                      // not a new tick
     if (s.last > 0) {
       const gap = t - s.last;
@@ -40,21 +43,25 @@ export function createGapWatch({ minThresholdMs = 90000, maxThresholdMs = 600000
     return Math.min(maxThresholdMs, Math.max(minThresholdMs, factor * s.ewma));
   }
   // Instruments silent for longer than their own threshold. marketOpen false => nothing is expected, so nothing is a gap.
-  function gapped(now = Date.now(), marketOpen = false, openedAt = openedAtIst(now)) {
+  function gapped(now = Date.now(), marketOpen = false, openedAt = openedAtIst(now), includeChecked = false) {
     if (!marketOpen) return [];
     const out = [];
     for (const [symbol, s] of book) {
       // Silence is measured from the later of the last tick and the market opening: yesterday's last tick is not a gap today.
-      const silentFor = now - Math.max(s.last, openedAt);
-      if (silentFor > thresholdFor(s) && now - openedAt > thresholdFor(s) && now - s.checkedAt > thresholdFor(s)) { out.push(symbol); if (!s.open) { s.open = true; triggered += 1; } }
+      const silentFor = now - Math.max(s.last, openedAt, s.registeredAt || 0);
+      if (silentFor > thresholdFor(s) && now - openedAt > thresholdFor(s) && (includeChecked || now - s.checkedAt > thresholdFor(s))) { out.push(symbol); if (!s.open) { s.open = true; triggered += 1; } }
     }
     return out;
   }
   function stats(now = Date.now(), marketOpen = false, openedAt = openedAtIst(now)) {
-    const gappedNow = gapped(now, marketOpen, openedAt).length;
+    const silent = gapped(now, marketOpen, openedAt, true);
+    const gappedNow = silent.length;
+    const unseen=[...book].filter(([,s])=>!s.last).map(([symbol])=>symbol);
+    const neverSeen=unseen.length;
+    const unpriced=new Set([...silent,...unseen]).size;
     while (closed.length && now - closed[0] > 3600000) closed.shift();
-    return { watching: book.size, gappedNow, gapsClosedLastHour: closed.length, gapsOpenedTotal: triggered, coverage: book.size ? 1 - gappedNow / book.size : 1 };
+    return { watching: book.size, neverSeen, gappedNow, gapsClosedLastHour: closed.length, gapsOpenedTotal: triggered, coverage: book.size ? 1 - unpriced / book.size : null };
   }
   function forget(symbol) { book.delete(symbol); }
-  return { observe, checked, gapped, stats, forget, size: () => book.size };
+  return { register, observe, checked, gapped, stats, forget, size: () => book.size };
 }
