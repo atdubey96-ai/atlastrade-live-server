@@ -16,17 +16,33 @@ export function evaluate(state, report, now = Date.now()) {
   for (const [feed, result] of Object.entries(report?.feeds || {})) {
     const label = NAMES[feed] || feed;
     const held = { bad: 0, good: 0, alerted: null, alertedAt: 0, ...(state[feed] || {}) };
+    // No device reports (or the same cached report twice) cannot establish recovery.
+    const unknown = !["ok","degraded","down"].includes(result.status) ||
+      (feed === "quoteQuality" && (result.reportingDevices === 0 || result.blockingFailureRate === null));
+    if (unknown) { held.good=0; held.bad=0; next[feed]=held; continue; }
+    if (feed === "quoteQuality" && Number.isFinite(result.observationAt)) {
+      if (result.observationAt <= (held.observationAt || 0)) { next[feed]=held; continue; }
+      held.observationAt=result.observationAt;
+    }
+    // A recovery needs a clear margin below the 20% failure threshold.
+    if(feed === "quoteQuality" && result.status === "ok" && result.blockingFailureRate > 0.1) {
+      held.good=0;held.bad=0;next[feed]=held;continue;
+    }
     const healthy = result.status === "ok";
     if (healthy) {
-      held.bad = 0; held.good += 1;
+      held.bad = 0; held.badStatus=null; held.good += 1;
       if (held.alerted && held.good >= CHECKS_BEFORE_ALERT) { messages.push(`✅ ${label} recovered.`); held.alerted = null; held.alertedAt = 0; }
     } else {
-      held.good = 0; held.bad += 1;
-      const sameProblemRecently = held.alerted === result.status && now - held.alertedAt < REPEAT_AFTER_MS;
+      held.good = 0; held.bad = held.badStatus === result.status ? held.bad+1 : 1; held.badStatus=result.status;
+      const sameProblemRecently = (held.lastSeverity || held.alerted) === result.status && now - (held.lastNotificationAt ?? held.alertedAt) < REPEAT_AFTER_MS;
       if (held.bad >= CHECKS_BEFORE_ALERT && !sameProblemRecently) {
-        const word = result.status === "down" ? "is not responding" : "is slow or stale";
-        messages.push(`⚠️ ${label} ${word}${result.detail ? ` (${result.detail})` : ""}. Prices from this source may be old; your other data is unaffected.`);
-        held.alerted = result.status; held.alertedAt = now;
+        const word = result.status === "down" ? "is not responding" : feed === "quoteQuality" ? "is rejecting quote updates" : "is slow or stale";
+        const impact = feed === "quoteQuality" ? (result.status === "down" ? "Device validation reporting is unavailable; current device quality cannot be verified." : "Rejected values are not applied. Check device data health before relying on displayed prices.") :
+          feed === "calendar" ? "Exchange holiday verification is unavailable; market-session status may be uncertain. This is not a price-feed outage." :
+          feed === "database" ? "Cloud access may be affected; check sync status before editing on another device." :
+          "This source may have delayed or missing prices; check its timestamp before relying on them.";
+        messages.push(`⚠️ ${label} ${word}${result.detail ? ` (${result.detail})` : ""}. ${impact}`);
+        held.alerted = result.status; held.alertedAt = now; held.lastNotificationAt=now;held.lastSeverity=result.status;
       }
     }
     next[feed] = held;
