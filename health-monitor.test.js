@@ -54,3 +54,8 @@ test("calendar alerts describe session uncertainty rather than stale prices",()=
  let e=evaluate({},{feeds:{calendar:{status:'down'}}},1);e=evaluate(e.state,{feeds:{calendar:{status:'down'}}},2);
  assert.match(e.messages[0],/not a price-feed outage/);assert.doesNotMatch(e.messages[0],/your other data is unaffected/);
 });
+
+test("partial recovery from down to degraded does not send a second warning",()=>{
+ let e=evaluate({},report('down'),0);e=evaluate(e.state,report('down'),1);
+ e=evaluate(e.state,report('degraded'),2);e=evaluate(e.state,report('degraded'),3);assert.equal(e.messages.length,0);
+});

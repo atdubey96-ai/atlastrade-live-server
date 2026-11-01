@@ -34,7 +34,8 @@ export function evaluate(state, report, now = Date.now()) {
       if (held.alerted && held.good >= CHECKS_BEFORE_ALERT) { messages.push(`✅ ${label} recovered.`); held.alerted = null; held.alertedAt = 0; }
     } else {
       held.good = 0; held.bad = held.badStatus === result.status ? held.bad+1 : 1; held.badStatus=result.status;
-      const sameProblemRecently = (held.lastSeverity || held.alerted) === result.status && now - (held.lastNotificationAt ?? held.alertedAt) < REPEAT_AFTER_MS;
+      const previousSeverity=held.lastSeverity || held.alerted;
+      const sameProblemRecently = !!previousSeverity && now - (held.lastNotificationAt ?? held.alertedAt) < REPEAT_AFTER_MS && !(result.status === "down" && previousSeverity !== "down");
       if (held.bad >= CHECKS_BEFORE_ALERT && !sameProblemRecently) {
         const word = result.status === "down" ? "is not responding" : feed === "quoteQuality" ? "is rejecting quote updates" : "is slow or stale";
         const impact = feed === "quoteQuality" ? (result.status === "down" ? "Device validation reporting is unavailable; current device quality cannot be verified." : "Rejected values are not applied. Check device data health before relying on displayed prices.") :
