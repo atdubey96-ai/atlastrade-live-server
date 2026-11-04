@@ -96,3 +96,44 @@ test("a market holiday is declared only when nothing says the market traded toda
   assert.ok(INDIA_SESSION_KINDS.has("morning") && INDIA_SESSION_KINDS.has("close"));
   assert.ok(!INDIA_SESSION_KINDS.has("evening") && !INDIA_SESSION_KINDS.has("night"));
 });
+
+
+import {formatHoldingsReport,summarizeOptions,formatOptionsReport,detailedReports,reportChunks} from './telegram.js';
+test('detailed holdings report ranks ten gainers and ten losers by daily percent, not all-time returns',()=>{
+ const holdings=[],quotes={};for(let i=1;i<=15;i++){for(const sign of [1,-1]){const symbol=(sign>0?'UP':'DOWN')+i;holdings.push({symbol,qty:i,avg:5});quotes[symbol]={ltp:100+sign*i,prev:100,asOf:'2026-10-28'};}}
+ const report=formatHoldingsReport(summarizeHoldings(holdings,s=>quotes[s]),NOW);
+ assert.match(report,/Top 10 daily gainers.*10/);assert.match(report,/1\. UP15/);assert.match(report,/1\. DOWN15/);assert.doesNotMatch(report,/11\. /);assert.match(report,/Price sessions: 2026-10-28/);assert.match(report,/Session P&L/);
+});
+test('duplicate holdings are grouped and missing previous closes do not become flat day returns',()=>{
+ const sum=summarizeHoldings([{symbol:'A',qty:2,avg:50},{symbol:'A',qty:3,avg:60},{symbol:'B',qty:1,avg:10}],s=>s==='A'?{ltp:100,prev:90}:{ltp:20});
+ assert.equal(sum.dayMissing,1);assert.equal(sum.rows.at(-1).day,null);assert.equal(sum.dayPct,NaN);
+ const report=formatHoldingsReport(sum,NOW);assert.match(report,/Valued 2 companies/);assert.match(report,/Partial session/);assert.equal((report.match(/1\. A /g)||[]).length,1);
+});
+const position=(id,extra={})=>({id,underlying:'NIFTY',expiry:'2026-11-03',strike:23000,type:'PE',side:'SELL',lots:1,avg:20,lotSize:65,addedAt:NOW,updatedAt:NOW,...extra});
+test('options report uses signed short/long P&L, lot size and explicit quote coverage',()=>{
+ const key='NIFTY|2026-11-03|23000|PE',quotes={[key]:{ltp:10,close:12,lotSize:65,ts:NOW}};
+ const summary=summarizeOptions([position('short')],quotes,NOW,true);assert.equal(summary.pnl,650);assert.equal(summary.day,130);
+ const long=summarizeOptions([position('long',{side:'BUY'})],quotes,NOW,true);assert.equal(long.pnl,-650);assert.equal(long.day,-130);
+ const missing=summarizeOptions([position('short')],{},NOW,true);assert.equal(missing.unpriced,1);assert.match(formatOptionsReport(missing,NOW),/Partial total P&L Unavailable/);assert.doesNotMatch(formatOptionsReport(missing,NOW),/Partial total P&L \+₹0/);
+ const stale=summarizeOptions([position('short')],{[key]:{...quotes[key],ts:NOW-60000}},NOW,true);assert.equal(stale.unpriced,1);
+});
+test('closed option contracts retain realised P&L while expired open contracts are not settled at zero',()=>{
+ const summary=summarizeOptions([position('s'),position('b',{side:'BUY',avg:10})],{},NOW,true);assert.equal(summary.closed,1);assert.equal(summary.realised,650);assert.equal(summary.pnl,650);
+ const expired=summarizeOptions([position('old',{expiry:'2026-10-01'})],{},NOW,true);assert.equal(expired.expired,1);assert.equal(expired.unpriced,1);
+});
+test('separate/combined reports preserve data and stay within Telegram message limits',()=>{
+ const text='Header\n'+Array.from({length:90},(_,i)=>`${i} ₹ ${'x'.repeat(80)}`).join('\n');
+ for(const chunks of [detailedReports(text,text,text),detailedReports(text,text,text,'combined'),reportChunks('x'.repeat(7800))]){assert.ok(chunks.length>1);assert.ok(chunks.every(x=>x.length>0&&x.length<=3900));}
+ assert.equal(detailedReports('market','holdings','options').length,3);assert.equal(detailedReports('market','holdings','options','combined').length,1);
+});
+test('unavailable portfolio feed is explicit instead of showing an empty portfolio',()=>{
+ assert.match(formatHoldingsReport(null,NOW,{available:false}),/temporarily unavailable/);assert.match(formatOptionsReport(null,NOW,{available:false}),/temporarily unavailable/);
+});
+
+import {sendReportBatch} from './telegram.js';
+test('a report delivery retry resumes after acknowledged messages without resending them',async()=>{
+ const pending={messages:['market','holdings','options'],next:0},sent=[];let fail=true;
+ const fetcher=async(_url,options)=>{const text=JSON.parse(options.body).text;sent.push(text);if(text==='holdings'&&fail){fail=false;throw Error('temporary outage');}return {ok:true,json:async()=>({ok:true,result:{}})};};
+ await assert.rejects(()=>sendReportBatch(fetcher,'TEST','fixture',pending,async()=>{}));assert.equal(pending.next,1);
+ await sendReportBatch(fetcher,'TEST','fixture',pending,async()=>{});assert.deepEqual(sent,['market','holdings','holdings','options']);assert.equal(pending.next,3);
+});

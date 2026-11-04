@@ -37,22 +37,23 @@ const pctText = p => (Number.isFinite(p) ? `${p >= 0 ? "+" : "−"}${Math.abs(p)
 // holdings: the site's saved holdings. quoteOf(symbol) -> { ltp, prev } or null. Only Indian-listed holdings are summed; funds, US stocks
 // and crypto have no quote from the exchange feed here, so they are left out instead of guessed.
 export function summarizeHoldings(holdings, quoteOf) {
-  const out = { count: 0, skipped: 0, value: 0, invested: 0, day: 0, rows: [] };
+  const out = { count: 0, skipped: 0, value: 0, invested: 0, day: 0, dayMissing:0, rows: [] };
   for (const h of holdings || []) {
     const symbol = String(h?.symbol || "");
     const qty = Number(h?.qty), avg = Number(h?.avg);
-    if (!symbol || !(qty > 0) || /-(MF|US|CX)$/i.test(symbol)) { if (symbol && qty > 0) out.skipped++; continue; }
+    if (!symbol || !(qty > 0) || !Number.isFinite(avg) || avg<0 || /-(MF|US|CX)$/i.test(symbol) || /^(?:BANKNIFTY|NIFTY)\d.*(?:CE|PE)$/i.test(symbol) || ["crypto","us_equity","mutual_fund"].includes(h.category)) { if (symbol && qty > 0) out.skipped++; continue; }
     const q = quoteOf(symbol);
     if (!q || !(q.ltp > 0)) { out.skipped++; continue; }
-    const prev = q.prev > 0 ? q.prev : q.ltp;
-    const day = qty * (q.ltp - prev);
-    out.count++; out.value += qty * q.ltp; out.invested += qty * avg; out.day += day;
-    out.rows.push({ symbol: symbol.replace(/-(EQ|BE|BZ|SM|ST)$/i, ""), day, dayPct: (q.ltp / prev - 1) * 100 });
+    const prev = q.prev > 0 ? q.prev : null;
+    const day = prev ? qty * (q.ltp - prev) : null;
+    if(day===null)out.dayMissing++;
+    out.count++; out.value += qty * q.ltp; out.invested += qty * avg; out.day += day||0;
+    out.rows.push({ symbol: symbol.replace(/-(EQ|BE|BZ|SM|ST)$/i, ""), day, dayPct: prev?(q.ltp / prev - 1) * 100:null, value:qty*q.ltp, previous:prev?qty*prev:0, asOf:q.asOf||null });
   }
   out.pnl = out.value - out.invested;
   out.pnlPct = out.invested > 0 ? out.pnl / out.invested * 100 : NaN;
   const prevValue = out.value - out.day;
-  out.dayPct = prevValue > 0 ? out.day / prevValue * 100 : NaN;
+  out.dayPct = !out.dayMissing&&prevValue > 0 ? out.day / prevValue * 100 : NaN;
   const byDay = out.rows.slice().sort((a, b) => b.day - a.day);
   out.best = byDay.filter(r => r.day > 0).slice(0, 3);
   out.worst = byDay.slice().reverse().filter(r => r.day < 0).slice(0, 3);
@@ -149,4 +150,50 @@ export async function findChats(fetchFn, token) {
     if (c && c.type === "private" && !chats.has(c.id)) chats.set(c.id, { id: c.id, name: [c.first_name, c.last_name].filter(Boolean).join(" ") || c.username || "" });
   }
   return [...chats.values()];
+}
+
+
+// Detailed reports reuse the application's option accounting rather than a second P&L formula.
+import {createRequire} from 'node:module';
+const positionsEngine=createRequire(import.meta.url)('./option-positions.cjs');
+const stamp=now=>{const t=istParts(now);return `${t.date} · ${String(Math.floor(t.minutes/60)).padStart(2,'0')}:${String(t.minutes%60).padStart(2,'0')} IST`;};
+const safeLabel=value=>String(value||'').replace(/[\r\n\x00-\x1f]/g,' ').slice(0,55);
+const precise=(value,signed=false)=>Number.isFinite(value)?`${value<0?'−':signed?'+':''}₹${num(Math.abs(value))}`:'Unavailable';
+function rankedRows(rows,key,side){return rows.filter(r=>Number.isFinite(r[key])&&(side==='top'?r[key]>0:r[key]<0)).sort((a,b)=>side==='top'?b[key]-a[key]:a[key]-b[key]).slice(0,10);}
+const rankLines=(title,rows,format)=>['',`${title} · ${rows.length}`,rows.length?rows.map((r,i)=>`${i+1}. ${format(r)}`).join('\n'):'None among priced positions.'];
+export function formatHoldingsReport(summary,now=Date.now(),{available=true,stale=false}={}){
+ const rows=summary?.rows||[],grouped=new Map();
+ for(const row of rows){const old=grouped.get(row.symbol);if(old){old.day=Number.isFinite(old.day)&&Number.isFinite(row.day)?old.day+row.day:null;old.value+=row.value||0;old.previous+=row.previous||0;old.dayPct=old.day!==null&&old.previous>0?old.day/old.previous*100:null;}else grouped.set(row.symbol,{...row});}
+ const companies=[...grouped.values()],top=rankedRows(companies,'dayPct','top'),bottom=rankedRows(companies,'dayPct','bottom');
+ if(!available)return `💼 Zenith · Holdings\n${stamp(now)}\nSaved portfolio is temporarily unavailable. No zero-value totals have been substituted.`;
+ if(!summary?.count)return `💼 Zenith · Holdings\n${stamp(now)}\nNo priced Indian holdings available. ${summary?.skipped||0} holdings excluded/unpriced. Totals are unavailable.`;
+ const mover=r=>`${safeLabel(r.symbol)} ${pctText(r.dayPct)} · ${precise(r.day,true)}`;
+ const dates=[...new Set(rows.map(r=>r.asOf).filter(Boolean))].sort();
+ return [`💼 Zenith · Holdings`,stamp(now),stale?'Saved portfolio: last cached snapshot':'Saved portfolio: latest available snapshot',`Valued ${companies.length} companies · ${summary?.skipped||0} holdings excluded/unpriced`,dates.length?`Price sessions: ${dates.join(', ')}`:'Price session dates unavailable',`Value ${precise(summary?.value)} · Invested ${precise(summary?.invested)}`,`Total P&L ${precise(summary?.pnl,true)} (${pctText(summary?.pnlPct)})`,`${summary?.dayMissing?"Partial session":"Session"} P&L ${precise(summary.dayMissing===summary.count?null:summary?.day,true)} (${pctText(summary?.dayPct)})`,...(summary?.dayMissing?['Daily change incomplete: previous-close data is missing for some holdings.']:[]),...rankLines('Top 10 daily gainers · ranked by %',top,mover),...rankLines('Bottom 10 daily losers · ranked by %',bottom,mover),'','Daily ranks use each stock’s available session change, not lifetime return. Excludes US stocks, crypto, mutual funds and unpriced holdings.'].join('\n');
+}
+export function summarizeOptions(positions,quotes={},now=Date.now(),marketOpen=false){
+ const clean=(positions||[]).map(p=>positionsEngine.sanitize(p,now)).filter(Boolean),groups=positionsEngine.groupPositions(clean),today=istParts(now).iso;
+ const out={count:groups.length,open:0,closed:0,expired:0,unpriced:0,dayMissing:0,pnl:0,day:0,realised:0,rows:[],expiries:[],quoteDates:[]};const byExpiry=new Map();
+ for(const g of groups){let q=quotes[g.key]||null;if(marketOpen&&(!q?.ts||q.ts>now+60000||now-q.ts>30000))q=null;
+  if(q?.ts&&Number.isFinite(q.ts))out.quoteDates.push(istParts(q.ts).iso);
+  const e=positionsEngine.evaluateGroup(g,q,today);if(g.closed){out.closed++;out.realised+=e.pnl||0;}else out.open++;if(e.expired&&!g.closed)out.expired++;
+  if(e.pnl===null)out.unpriced++;else out.pnl+=e.pnl;
+  if(!g.closed&&e.dayChange===null)out.dayMissing++;else if(Number.isFinite(e.dayChange))out.day+=e.dayChange;
+  const row={underlying:g.underlying,expiry:g.expiry,strike:g.strike,type:g.type,side:g.side,lots:g.lots,pnl:e.pnl,day:e.dayChange,closed:g.closed,expired:e.expired};out.rows.push(row);
+  const bucket=byExpiry.get(g.expiry)||{expiry:g.expiry,count:0,pnl:0,day:0,unpriced:0,dayMissing:0,dayKnown:0};bucket.count++;if(e.pnl!==null)bucket.pnl+=e.pnl;else bucket.unpriced++;if(Number.isFinite(e.dayChange)){bucket.day+=e.dayChange;bucket.dayKnown++;}else if(!g.closed)bucket.dayMissing++;byExpiry.set(g.expiry,bucket);
+ }
+ out.quoteDates=[...new Set(out.quoteDates)].sort();out.expiries=[...byExpiry.values()].sort((a,b)=>a.expiry.localeCompare(b.expiry));return out;
+}
+export function formatOptionsReport(summary,now=Date.now(),{available=true,stale=false}={}){
+ if(!available)return `📊 Zenith · Option positions\n${stamp(now)}\nSaved option positions are temporarily unavailable.`;
+ if(!summary.count)return `📊 Zenith · Option positions\n${stamp(now)}\nNo saved option positions.`;
+ const row=r=>`${r.underlying==='BANKNIFTY'?'Bank Nifty':'Nifty'} ${num(r.strike,0)} ${r.type} ${r.expiry.slice(5)} · ${r.side} ${r.lots}L · Day ${precise(r.day,true)} · Total ${precise(r.pnl,true)}`;
+ return [`📊 Zenith · Option positions`,stamp(now),stale?'Saved records: cached snapshot':'Saved records: latest available snapshot',`${summary.open} open · ${summary.closed} offset/closed contracts`,summary.quoteDates.length?`Quote sessions: ${summary.quoteDates.join(', ')}`:'Quote session dates unavailable',`${summary.unpriced?'Partial total':'Total'} P&L ${precise(summary.count===summary.unpriced?null:summary.pnl,true)}`,`${summary.dayMissing?'Partial session':'Session'} P&L ${precise(summary.rows.some(r=>Number.isFinite(r.day))?summary.day:null,true)}`,`Closed-contract realised P&L ${precise(summary.realised,true)}`,`Coverage: ${summary.count-summary.unpriced}/${summary.count} contracts valued · ${summary.expired} expired open contracts`,...(summary.unpriced?['Unpriced/expired legs are not assumed to be settled at zero.']:[]),'','By expiry · Total P&L / Session P&L',...summary.expiries.map(e=>`${e.expiry} · ${e.count} contracts · ${precise(e.count===e.unpriced?null:e.pnl,true)} / ${precise(e.dayKnown?e.day:null,true)}${e.unpriced||e.dayMissing?' · partial':''}`),...rankLines('Top 10 session contributors · ₹',rankedRows(summary.rows,'day','top'),row),...rankLines('Bottom 10 session contributors · ₹',rankedRows(summary.rows,'day','bottom'),row),'','P&L follows saved Zenith trade records; it is not a broker settlement statement. Quotes are the latest available session, not guaranteed live.'].join('\n');
+}
+// Telegram permits at most 4096 characters; split at lines without losing any report.
+export function reportChunks(text,limit=3900){const chunks=[];let current='';for(const line of String(text).split('\n')){for(let part of (line.length>limit?line.match(new RegExp(`[\\s\\S]{1,${limit}}`,'g')):[line])){if(current&&current.length+part.length+1>limit){chunks.push(current);current='';}current+=(current?'\n':'')+part;}}if(current)chunks.push(current);return chunks;}
+export function detailedReports(market,holdings,options,mode='separate'){return (mode==='combined'?[`${market}\n\n${holdings}\n\n${options}`]:[market,holdings,options]).flatMap(text=>{const chunks=reportChunks(text);return chunks.length>1?chunks.map((chunk,i)=>`Zenith report · ${i+1}/${chunks.length}\n${chunk}`):chunks;});}
+
+export async function sendReportBatch(fetchFn,token,chatId,pending,pause=()=>new Promise(resolve=>setTimeout(resolve,1100))){
+ while(pending.next<pending.messages.length){await sendTelegram(fetchFn,token,chatId,pending.messages[pending.next]);pending.next++;if(pending.next<pending.messages.length)await pause();}
 }

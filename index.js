@@ -17,7 +17,7 @@ import WebSocket from "ws";
 import { angelFeedTimeMs, exchangeTimeMs, storeQuote, servableQuotes, staleSymbols } from "./price-book.js";
 import { createGapWatch, openedAtIst } from "./gap-watch.js";
 import { evaluate as evaluateHealth, emptyState as healthState } from "./health-monitor.js";
-import { formatUpdate, dueUpdate, sendTelegram, findChats, summarizeHoldings, holdingsLines, isIndiaTradingDay, INDIA_SESSION_KINDS } from "./telegram.js";
+import { formatUpdate, dueUpdate, sendTelegram, findChats, summarizeHoldings, holdingsLines, formatHoldingsReport, summarizeOptions, formatOptionsReport, detailedReports, sendReportBatch, isIndiaTradingDay, INDIA_SESSION_KINDS } from "./telegram.js";
 import { parseSnapPacket, parseRestQuote, storeTick, buildChain, windowTokens, bookKey, EXCHANGE_TYPE, resolveContract, quoteView, candleRequest, parseCandles } from "./options.js";
 
 const cashDirectory = createDirectory(fetch);
@@ -724,23 +724,21 @@ async function marketSnapshot() {
 }
 
 // Your saved holdings, read from the site's own storage endpoint and kept for five minutes.
-let holdingsCache = { at: 0, list: [] };
-async function savedHoldings() {
-  if (Date.now() - holdingsCache.at < 5 * 60 * 1000) return holdingsCache.list;
+let holdingsCache = { at: 0, list: [], optionPositions: [], optionsAvailable:false, available:false };
+async function savedPortfolio() {
+  if (Date.now() - holdingsCache.at < 5 * 60 * 1000) return {...holdingsCache,stale:false};
   try {
-    // The site no longer serves portfolios to anonymous callers; this service reads a minimal holdings list with its scoped token.
     const res = await fetch(`${SITE_URL}/api/indices?route=holdings`, { headers: { Authorization: `Bearer ${process.env.LIVE_SERVICE_TOKEN || ""}` }, signal: AbortSignal.timeout(25000) });
     if (!res.ok) throw new Error("HTTP " + res.status);
     const body = await res.json();
-    holdingsCache = { at: Date.now(), list: Array.isArray(body?.holdings) ? body.holdings : [] };
-  } catch (error) { console.warn("Holdings unavailable for Telegram:", error.message); }
-  return holdingsCache.list;
+    if(!Array.isArray(body?.holdings))throw Error("Invalid portfolio feed");
+    holdingsCache = { at: Date.now(), list: body.holdings, optionPositions:Array.isArray(body.optionPositions)?body.optionPositions:[], optionsAvailable:Array.isArray(body.optionPositions), available:true };
+    return {...holdingsCache,stale:false};
+  } catch (error) { console.warn("Portfolio unavailable for Telegram:", error.message);return {...holdingsCache,stale:true}; }
 }
 
-// Holdings priced from the live feed, with the exchange's own previous close for today's change.
-async function holdingsSummaryLines() {
-  const holdings = await savedHoldings();
-  if (!holdings.length) return [];
+async function holdingsSummary(portfolio) {
+  const holdings = portfolio.list;
   const symbols = [...new Set(holdings.map(h => String(h.symbol || "")).filter(s => s && !/-(MF|US|CX)$/i.test(s)))];
   const official = {};
   for (let i = 0; i < symbols.length; i += 150) {
@@ -750,20 +748,33 @@ async function holdingsSummaryLines() {
     } catch (_) {}
   }
   const live = servableQuotes(prices, symbols, {now:Date.now(),marketOpen:isNseMarketOpen()});
-  const quoteOf = symbol => {
-    const q = live[symbol], o = official[symbol];
-    if (q && q.ltp > 0) return { ltp: q.ltp, prev: o && o.prevClose > 0 ? o.prevClose : q.close };
-    return o && o.close > 0 ? { ltp: o.close, prev: o.prevClose } : null; // no live tick: the last official close
-  };
-  return holdingsLines(summarizeHoldings(holdings, quoteOf));
+  return summarizeHoldings(holdings,symbol=>{
+    const q=live[symbol],o=official[symbol];
+    if(q&&q.ltp>0){const day=q.ts?new Date(q.ts+19800000).toISOString().slice(0,10):null;if(o?.date&&day&&o.date>day)return {ltp:o.close,prev:o.prevClose,asOf:o.date};const prev=o?.date&&day?(o.date===day?o.prevClose:o.date<day?o.close:q.close):q.close;return {ltp:q.ltp,prev,asOf:day||o?.date};}
+    return o?.close>0?{ltp:o.close,prev:o.prevClose,asOf:o.date}:null;
+  });
 }
-
+async function optionSummary(portfolio){
+  const quotes={},today=new Date(Date.now()+19800000).toISOString().slice(0,10);
+  const keys=[...new Set(summarizeOptions(portfolio.optionPositions,{},Date.now(),false).rows.filter(p=>!p.closed&&p.expiry>=today).map(p=>`${p.underlying}|${p.expiry}|${p.strike}|${p.type}`))];
+  for(let i=0;i<keys.length;i+=60){try{const res=await fetch(`http://localhost:${PORT}/options/quotes?items=${encodeURIComponent(keys.slice(i,i+60).join(','))}`,{signal:AbortSignal.timeout(30000)});if(res.ok)Object.assign(quotes,(await res.json()).quotes||{});}catch(error){console.warn("Option summary quotes unavailable:",error.message);}}
+  return summarizeOptions(portfolio.optionPositions,quotes,Date.now(),isOptionsMarketOpen());
+}
+const telegramPendingReports=new Map();
 async function sendMarketUpdate(kind) {
   if (!TELEGRAM_TOKEN || !telegramChatId) throw new Error("Telegram is not set up yet");
-  const { quotes, chains } = await marketSnapshot();
-  if (!Object.keys(quotes).length) throw new Error("Market data is unavailable right now");
-  const holdings = await holdingsSummaryLines().catch(() => []);
-  await sendTelegram(fetch, TELEGRAM_TOKEN, telegramChatId, formatUpdate(kind, quotes, chains, Date.now(), holdings));
+  const key=kind==='sample'?`sample-${Date.now()}`:`${kind}-${new Date(Date.now()+19800000).toISOString().slice(0,10)}`;
+  let pending=telegramPendingReports.get(key);
+  if(!pending){
+    const {quotes,chains}=await marketSnapshot(),portfolio=await savedPortfolio();
+    const [holdings,options]=await Promise.all([holdingsSummary(portfolio),optionSummary(portfolio)]);
+    const now=Date.now(),metadata={available:portfolio.available,stale:portfolio.stale};
+    const market=formatUpdate(kind,quotes,chains,now,[])+(Object.keys(quotes).length?'':'\nMarket overview quotes unavailable.');
+    pending={next:0,messages:detailedReports(market,formatHoldingsReport(holdings,now,metadata),formatOptionsReport(options,now,{...metadata,available:portfolio.available&&portfolio.optionsAvailable}),process.env.TELEGRAM_REPORT_MODE==='combined'?'combined':'separate')};
+    telegramPendingReports.set(key,pending);
+    if(telegramPendingReports.size>12)telegramPendingReports.delete(telegramPendingReports.keys().next().value);
+  }
+  await sendReportBatch(fetch,TELEGRAM_TOKEN,telegramChatId,pending);
 }
 
 // True when the market traded today (or when that cannot be told: a missed message is worse than an extra one).
@@ -836,3 +847,4 @@ healthMonitorTimer.unref?.();
 
 async function refreshTradingCalendar(){try{const r=await fetch(`${SITE_URL}/api/indices?route=calendar`,{signal:AbortSignal.timeout(15000)});if(r.ok)marketCalendar.applyCalendar(await r.json());}catch{}}
 refreshTradingCalendar();const calendarTimer=setInterval(refreshTradingCalendar,6*3600000);calendarTimer.unref?.();
+
