@@ -7,6 +7,8 @@ import { angelFeedTimeMs, exchangeTimeMs } from "./price-book.js";
 const M = createRequire(import.meta.url)("./option-math.cjs");
 
 export const EXCHANGE_TYPE = { NSE: 1, NFO: 2, BSE: 3, BFO: 4 };
+// The derivatives exchange of an underlying: NFO for Nifty and Bank Nifty, BFO for Sensex. The contract list names it; NFO is the default.
+export const foExchange = meta => (meta && meta.exchange === "BFO" ? "BFO" : "NFO");
 export const bookKey = (exchangeType, token) => `${exchangeType}:${String(token)}`;
 
 const num = v => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
@@ -137,7 +139,7 @@ export function buildChain({ meta, expiry, book, now = Date.now(), width = 20, m
   const spotTick = book.get(bookKey(EXCHANGE_TYPE[meta.spot.exchange] || 1, meta.spot.token));
   const spot = spotTick?.ltp > 0 ? spotTick.ltp : null;
 
-  const tickOf = ref => (ref ? book.get(bookKey(EXCHANGE_TYPE.NFO, ref.token)) : null);
+  const tickOf = ref => (ref ? book.get(bookKey(EXCHANGE_TYPE[foExchange(meta)], ref.token)) : null);
   // The window is centred on the strike nearest the spot, or on the middle of the list while no spot is known.
   let centre = Math.floor(strikes.length / 2);
   if (spot) {
@@ -212,8 +214,9 @@ export function windowTokens({ meta, expiry, spot, width = 20 }) {
   }
   const list = [{ exchange: meta.spot.exchange, exchangeType: EXCHANGE_TYPE[meta.spot.exchange] || 1, token: meta.spot.token }];
   for (const s of strikes.slice(Math.max(0, centre - width - 3), Math.min(strikes.length, centre + width + 4))) {
-    if (s.ce) list.push({ exchange: "NFO", exchangeType: 2, token: s.ce.token });
-    if (s.pe) list.push({ exchange: "NFO", exchangeType: 2, token: s.pe.token });
+    const fo = foExchange(meta);
+    if (s.ce) list.push({ exchange: fo, exchangeType: EXCHANGE_TYPE[fo], token: s.ce.token });
+    if (s.pe) list.push({ exchange: fo, exchangeType: EXCHANGE_TYPE[fo], token: s.pe.token });
   }
   return list;
 }
@@ -224,7 +227,8 @@ export function resolveContract(metaAll, underlying, expiry, strike, type) {
   const exp = u?.expiries.find(e => e.date === expiry);
   const row = exp?.strikes.find(x => x.k === Number(strike));
   const side = String(type || "").toUpperCase() === "PE" ? row?.pe : String(type || "").toUpperCase() === "CE" ? row?.ce : null;
-  return side ? { token: side.token, symbol: side.symbol, lotSize: u.lotSize, exchange: "NFO", exchangeType: EXCHANGE_TYPE.NFO } : null;
+  const fo = foExchange(u);
+  return side ? { token: side.token, symbol: side.symbol, lotSize: u.lotSize, exchange: fo, exchangeType: EXCHANGE_TYPE[fo] } : null;
 }
 
 // What a position needs from a quote: price, previous close, spread and the data time.
@@ -248,10 +252,10 @@ const pad = n => String(n).padStart(2, "0");
 const istStamp = ms => { const d = new Date(ms + IST_MS); return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`; };
 
 // Returns the body for getCandleData, or null when the token or interval is not acceptable.
-export function candleRequest(token, interval, now = Date.now()) {
+export function candleRequest(token, interval, now = Date.now(), exchange = "NFO") {
   const days = CANDLE_INTERVALS[interval];
   if (!/^\d{1,9}$/.test(String(token || "")) || !days) return null;
-  return { exchange: "NFO", symboltoken: String(token), interval, fromdate: istStamp(now - days * 86400000), todate: istStamp(now) };
+  return { exchange: exchange === "BFO" ? "BFO" : "NFO", symboltoken: String(token), interval, fromdate: istStamp(now - days * 86400000), todate: istStamp(now) };
 }
 
 // rows: [["2026-10-28T09:15:00+05:30", open, high, low, close, volume], ...]. Daily candles carry the trading date at 15:30

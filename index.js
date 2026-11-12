@@ -18,7 +18,7 @@ import { angelFeedTimeMs, exchangeTimeMs, storeQuote, servableQuotes, staleSymbo
 import { createGapWatch, openedAtIst } from "./gap-watch.js";
 import { evaluate as evaluateHealth, emptyState as healthState } from "./health-monitor.js";
 import { formatUpdate, dueUpdate, sendTelegram, findChats, summarizeHoldings, holdingsLines, formatHoldingsReport, summarizeOptions, formatOptionsReport, detailedReports, sendReportBatch, isIndiaTradingDay, INDIA_SESSION_KINDS } from "./telegram.js";
-import { parseSnapPacket, parseRestQuote, storeTick, buildChain, windowTokens, bookKey, EXCHANGE_TYPE, resolveContract, quoteView, candleRequest, parseCandles } from "./options.js";
+import { parseSnapPacket, parseRestQuote, storeTick, buildChain, windowTokens, bookKey, EXCHANGE_TYPE, resolveContract, foExchange, quoteView, candleRequest, parseCandles } from "./options.js";
 
 const cashDirectory = createDirectory(fetch);
 const app = express();
@@ -647,7 +647,7 @@ app.get("/options/quotes", async (req, res) => {
     const quotes = {};
     for (const [key, contract] of found) {
       const view = quoteView(optionBook.get(bookKey(contract.exchangeType, contract.token)));
-      quotes[key] = view ? { ...view, instrumentId:identity.quoteId({symbol:contract.symbol,exchange:"NFO"}), symbol: contract.symbol, lotSize: contract.lotSize } : { symbol: contract.symbol, lotSize: contract.lotSize, ltp: null };
+      quotes[key] = view ? { ...view, instrumentId:identity.quoteId({symbol:contract.symbol,exchange:contract.exchange}), symbol: contract.symbol, lotSize: contract.lotSize } : { symbol: contract.symbol, lotSize: contract.lotSize, ltp: null };
     }
     res.json({ quotes, feed: { connected: wsConn?.readyState === WebSocket.OPEN, marketOpen: isNseMarketOpen() } });
   } catch (error) { res.status(502).json({ error: error.message }); }
@@ -676,9 +676,10 @@ app.get("/options/candles", async (req, res) => {
   res.set("Cache-Control", "no-store, max-age=0");
   const token = String(req.query.token || "");
   const interval = String(req.query.interval || "ONE_DAY").toUpperCase();
-  const body = candleRequest(token, interval);
+  const exchange = String(req.query.exchange || "NFO").toUpperCase() === "BFO" ? "BFO" : "NFO";
+  const body = candleRequest(token, interval, Date.now(), exchange);
   if (!body) return res.status(400).json({ error: "token and a supported interval are required" });
-  const key = `${token}:${interval}`;
+  const key = `${exchange}:${token}:${interval}`;
   const ttl = interval === "ONE_DAY" ? 5 * 60 * 1000 : 45 * 1000;
   try {
     const payload = await optionCandleHistory.load(key, ttl, async () => {
