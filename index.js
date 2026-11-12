@@ -457,17 +457,22 @@ async function loadOptionMeta() {
 }
 
 // ─── Auto-login and keep-alive ────────────────────────────────────────────────
-async function ensureLoggedIn(force = false) {
+let ensureLoginPromise = null;
+function ensureLoggedIn(force = false) {
+  // Every caller waits for the same login, including requests arriving during
+  // startup. Returning early here used to report missing history credentials.
+  if (ensureLoginPromise) return ensureLoginPromise;
   const tokenAge = Date.now() - lastLoginAt;
-  // Re-login every 23 hours (tokens expire at 24h)
-  if (force || !aoToken || tokenAge > 23 * 60 * 60 * 1000) {
+  if (!force && aoToken && tokenAge <= 23 * 60 * 60 * 1000) return Promise.resolve();
+  ensureLoginPromise = (async () => {
     const ok = await loginAngelOne();
     if (ok) {
       connectWebSocket();
       const tracked = [...symbolToToken.entries()].map(([symbol, value]) => ({ symbol, ...value }));
       if (tracked.length) primeSnapshots(tracked).catch(() => {});
     }
-  }
+  })().finally(() => { ensureLoginPromise = null; });
+  return ensureLoginPromise;
 }
 
 // Login on startup, re-login every 23 hours
