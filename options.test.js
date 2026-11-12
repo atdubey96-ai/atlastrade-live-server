@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseSnapPacket, parseRestQuote, storeTick, buildChain, windowTokens, bookKey, resolveContract, quoteView, candleRequest, parseCandles } from "./options.js";
+import { parseSnapPacket, parseRestQuote, storeTick, buildChain, windowTokens, bookKey, resolveContract, quoteView, candleRequest, parseCandles, foExchange } from "./options.js";
 import { createRequire } from "node:module";
 const M = createRequire(import.meta.url)("./option-math.cjs");
 
@@ -173,3 +173,22 @@ test("chain legs carry the fair price as ltp and keep the raw last price", async
 
 test('undated option packets cannot erase dated quotes or refresh OI',()=>{const book=new Map();storeTick(book,{exchangeType:2,token:'1',ltp:10,oi:100,ts:NOW});storeTick(book,{exchangeType:2,token:'1',ltp:11,ts:NOW+1000});assert.equal(book.get('2:1').oiTs,NOW);assert.equal(storeTick(book,{exchangeType:2,token:'1',ltp:9,ts:0}),false);assert.equal(book.get('2:1').ltp,11);});
 test('a fresh spot does not make stale option Greeks or OI current',()=>{const {meta,book}=fixture();book.get('1:99926000').ts=NOW+120000;const chain=buildChain({meta,expiry:'2026-11-03',book,now:NOW+120000,width:3,marketOpen:true});assert.equal(chain.spotFresh,true);assert.equal(chain.priceComplete,false);assert.equal(chain.oiComplete,false);assert.equal(chain.pcr,null);assert.equal(chain.maxPain,null);assert.ok(chain.rows.every(row=>row.ce.iv===null&&row.pe.delta===null));});
+
+test("Sensex options live on BFO: their tokens, chain ticks, positions and history use that exchange", () => {
+  const sensex = { name: "SENSEX", label: "Sensex", exchange: "BFO", lotSize: 20, tick: 0.05, spot: { token: "99919000", exchange: "BSE", symbol: "SENSEX" },
+    expiries: [{ date: "2026-11-17", monthly: false, strikes: [{ k: 83000, ce: { token: "1001", symbol: "SENSEX17NOV2683000CE" }, pe: { token: "1002", symbol: "SENSEX17NOV2683000PE" } }] }] };
+  assert.equal(foExchange(sensex), "BFO");
+  assert.equal(foExchange({ name: "NIFTY" }), "NFO", "contracts without the field stay on NFO");
+  const list = windowTokens({ meta: sensex, expiry: "2026-11-17", spot: 83000, width: 5 });
+  assert.deepEqual(list.map(x => [x.exchange, x.exchangeType, x.token]), [["BSE", 3, "99919000"], ["BFO", 4, "1001"], ["BFO", 4, "1002"]]);
+  const c = resolveContract({ SENSEX: sensex }, "SENSEX", "2026-11-17", 83000, "CE");
+  assert.equal(c.exchange, "BFO"); assert.equal(c.exchangeType, 4); assert.equal(c.token, "1001");
+  const book = new Map();
+  storeTick(book, { mode: 3, exchangeType: 4, token: "1001", ltp: 410.5, ts: NOW, close: 400 });
+  storeTick(book, { mode: 3, exchangeType: 3, token: "99919000", ltp: 83010, ts: NOW, close: 82900 });
+  const chain = buildChain({ meta: sensex, expiry: "2026-11-17", book, now: NOW, width: 5, marketOpen: true });
+  assert.equal(chain.underlying, "SENSEX"); assert.equal(chain.rows[0].ce.ltp, 410.5);
+  assert.equal(candleRequest("1001", "ONE_DAY", NOW, "BFO").exchange, "BFO");
+  assert.equal(candleRequest("1001", "ONE_DAY", NOW).exchange, "NFO");
+  assert.equal(candleRequest("1001", "ONE_DAY", NOW, "XYZ").exchange, "NFO");
+});
