@@ -11,7 +11,9 @@ export async function recoverCandleHistory(body, request, parse, now = Date.now(
     try {
       const { ok, status, json } = await request(current, attempt);
       if (!ok || json?.status !== true || !Array.isArray(json.data)) {
-        const error = new Error(status === 401 || status === 403 ? 'Broker history access is temporarily unavailable' : 'The broker returned an invalid history response');
+        const brokerCode = String(json?.errorcode || json?.errorCode || '').toUpperCase().replace(/[^A-Z0-9_]/g, '').slice(0, 24);
+        const error = new Error((status === 401 || status === 403 ? 'Broker history access is temporarily unavailable' : 'The broker returned an invalid history response') + (brokerCode ? ' (' + brokerCode + ')' : ''));
+        error.brokerCode = brokerCode;
         error.status = status;
         throw error;
       }
