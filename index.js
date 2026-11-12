@@ -1,4 +1,4 @@
-import { recoverCandleHistory } from './candle-history.js';
+import { recoverCandleHistory, createCandleHistoryStore } from './candle-history.js';
 import identity from "./instrument-identity.cjs";
 import {requireService} from './service-auth.js';
 import {createDirectory,matchesDirectory,partitionDirectory,repairPair} from './cash-directory.js';
@@ -658,7 +658,15 @@ async function angelRestGate(gap = 450) {
 }
 
 // Candle history for one option contract (any expiry), through the same Angel session as the quotes.
-const optionCandleCache = new Map();
+const optionCandleHistory = createCandleHistoryStore();
+let optionHistorySessionRepair = null, optionHistorySessionRepairAt = 0;
+async function repairOptionHistorySession() {
+  if (optionHistorySessionRepair) return optionHistorySessionRepair;
+  if (Date.now() - optionHistorySessionRepairAt < 60000) return;
+  optionHistorySessionRepairAt = Date.now();
+  optionHistorySessionRepair = ensureLoggedIn(true).finally(() => { optionHistorySessionRepair = null; });
+  return optionHistorySessionRepair;
+}
 app.get("/options/candles", async (req, res) => {
   res.set("Cache-Control", "no-store, max-age=0");
   const token = String(req.query.token || "");
@@ -667,11 +675,10 @@ app.get("/options/candles", async (req, res) => {
   if (!body) return res.status(400).json({ error: "token and a supported interval are required" });
   const key = `${token}:${interval}`;
   const ttl = interval === "ONE_DAY" ? 5 * 60 * 1000 : 45 * 1000;
-  const held = optionCandleCache.get(key);
-  if (held && Date.now() - held.at < ttl) return res.json(held.payload);
   try {
+    const payload = await optionCandleHistory.load(key, ttl, async () => {
     await ensureLoggedIn();
-    if (!aoToken) return res.status(503).json({ error: "The broker session is not ready" });
+    if (!aoToken) throw new Error("The broker session is not ready");
     // Angel limits how fast history can be requested and answers a burst with 403 or an access-rate message; a short pause
     // and a second try clears it.
     const candles = await recoverCandleHistory(body, async (requestBody, attempt) => {
@@ -682,10 +689,9 @@ app.get("/options/candles", async (req, res) => {
       });
       const json = await response.json().catch(() => null);
       return {ok: response.ok, status: response.status, json};
-    }, parseCandles);
-    const payload = { token, interval, count: candles.length, candles };
-    if (candles.length) optionCandleCache.set(key, { at: Date.now(), payload });
-    if (optionCandleCache.size > 200) optionCandleCache.delete(optionCandleCache.keys().next().value);
+    }, parseCandles, Date.now(), repairOptionHistorySession);
+    return { token, interval, count: candles.length, candles };
+    });
     res.json(payload);
   } catch (error) { res.status(error.code === "HISTORY_EMPTY" ? 404 : 502).json({ error: error.message, code: error.code === "HISTORY_EMPTY" ? "HISTORY_EMPTY" : "HISTORY_UPSTREAM" }); }
 });
