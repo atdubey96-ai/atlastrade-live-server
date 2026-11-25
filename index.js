@@ -702,6 +702,35 @@ app.get("/options/candles", async (req, res) => {
   } catch (error) { res.status(error.code === "HISTORY_EMPTY" ? 404 : 502).json({ error: error.message, code: error.code === "HISTORY_EMPTY" ? "HISTORY_EMPTY" : "HISTORY_UPSTREAM" }); }
 });
 
+// Read-only cash history for Yahoo coverage gaps. Resolve the symbol against the
+// broker directory, never accept an arbitrary token or change subscriptions.
+const cashCandleHistory = createCandleHistoryStore();
+app.get("/equities/candles", requireService, async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  const symbol=String(req.query.symbol||"").trim().toUpperCase();
+  const exchange=String(req.query.exchange||"NSE").toUpperCase();
+  const interval=String(req.query.interval||"ONE_DAY").toUpperCase();
+  if(!/^[A-Z0-9&_. -]{1,40}$/.test(symbol)||!['NSE','BSE'].includes(exchange)||!['FIVE_MINUTE','FIFTEEN_MINUTE','ONE_HOUR','ONE_DAY'].includes(interval))return res.status(400).json({error:'Invalid cash chart request'});
+  try {
+    const directory=await cashDirectory();
+    const saved=symbolToToken.get(symbol);
+    const pair=repairPair(directory,{symbol,exchange,token:saved?.exchange===exchange?saved.token:''});
+    if(!pair)return res.status(404).json({error:'No unique verified cash instrument',code:'HISTORY_MAPPING'});
+    const payload=await cashCandleHistory.load(`${exchange}:${pair.token}:${interval}`,interval==='ONE_DAY'?300000:45000,async()=>{
+      const body={...candleRequest(pair.token,interval),exchange};
+      if(!body.symboltoken)throw Error('Invalid cash history token');
+      await ensureLoggedIn();if(!aoToken)throw Error('Broker history session unavailable');
+      const candles=await recoverCandleHistory(body,async requestBody=>{
+        await angelRestGate();
+        const response=await fetch('https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData',{method:'POST',headers:quoteHeaders(),body:JSON.stringify(requestBody),signal:AbortSignal.timeout(6000)});
+        return {ok:response.ok,status:response.status,json:await response.json().catch(()=>null)};
+      },parseCandles,Date.now(),repairOptionHistorySession);
+      return {symbol,exchange,interval,source:'angel-cash-history',count:candles.length,candles};
+    });
+    return res.json(payload);
+  }catch(error){return res.status(error.code==='HISTORY_EMPTY'?404:502).json({error:'Cash chart history temporarily unavailable',code:error.code==='HISTORY_EMPTY'?'HISTORY_EMPTY':'HISTORY_UPSTREAM'});}
+});
+
 app.get("/options/debug", (req, res) => {
   res.set("Cache-Control", "no-store");
   res.json({
